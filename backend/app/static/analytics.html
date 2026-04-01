@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Metricas de Consumo</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="analytics-shell">
+      <header class="chat-header analytics-header">
+        <div>
+          <p class="eyebrow">Observabilidad</p>
+          <h1>Metricas de consumo</h1>
+          <p class="muted">Resumen agregado y bitacora detallada de consultas, latencias, tokens y costos en pesos mexicanos.</p>
+        </div>
+        <div class="header-actions">
+          <div class="selected-chip" id="analytics-dataset-chip">Todos los datasets</div>
+          <a class="ghost-button" href="/">Volver al chat</a>
+          <button class="ghost-button" id="analytics-refresh" type="button">Actualizar</button>
+        </div>
+      </header>
+
+      <section class="card analytics-filters-card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Filtros</p>
+            <h2>Consulta del historial</h2>
+          </div>
+          <p class="status-text" id="analytics-status-text">Cargando metricas...</p>
+        </div>
+
+        <form class="analytics-filter-grid" id="analytics-filter-form">
+          <label class="field">
+            <span>Dataset</span>
+            <select id="filter-dataset">
+              <option value="">Todos los datasets</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Status</span>
+            <select id="filter-status">
+              <option value="">Todos</option>
+              <option value="ok">ok</option>
+              <option value="assistant_message">assistant_message</option>
+              <option value="needs_clarification">needs_clarification</option>
+              <option value="validation_error">validation_error</option>
+              <option value="rate_limited">rate_limited</option>
+              <option value="gemini_error">gemini_error</option>
+              <option value="gemini_unavailable">gemini_unavailable</option>
+              <option value="not_found">not_found</option>
+              <option value="error">error</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Cache</span>
+            <select id="filter-cache-hit">
+              <option value="">Todos</option>
+              <option value="false">fresh</option>
+              <option value="true">cache</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Desde</span>
+            <input id="filter-from" type="datetime-local" />
+          </label>
+
+          <label class="field">
+            <span>Hasta</span>
+            <input id="filter-to" type="datetime-local" />
+          </label>
+
+          <label class="field">
+            <span>User ID</span>
+            <input id="filter-user-id" type="text" placeholder="Ej. web-1234..." />
+          </label>
+        </form>
+      </section>
+
+      <section class="analytics-summary-grid" id="analytics-summary-grid"></section>
+
+      <section class="card analytics-chart-card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Progresion</p>
+            <h2>Costo diario acumulado</h2>
+          </div>
+          <p class="muted">Barras apiladas por costo diario y linea acumulada en MXN.</p>
+        </div>
+        <div id="analytics-timeseries-chart"></div>
+      </section>
+
+      <section class="analytics-breakdown-grid">
+        <article class="card analytics-breakdown-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Breakdown</p>
+              <h2>Por status</h2>
+            </div>
+          </div>
+          <div id="breakdown-status"></div>
+        </article>
+
+        <article class="card analytics-breakdown-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Breakdown</p>
+              <h2>Por modelo</h2>
+            </div>
+          </div>
+          <div id="breakdown-model"></div>
+        </article>
+
+        <article class="card analytics-breakdown-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Breakdown</p>
+              <h2>Por etapa</h2>
+            </div>
+          </div>
+          <div id="breakdown-stage"></div>
+        </article>
+      </section>
+
+      <section class="card analytics-table-card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Bitacora</p>
+            <h2>Consultas registradas</h2>
+          </div>
+          <div class="analytics-pagination">
+            <button class="ghost-button" id="page-prev" type="button">Anterior</button>
+            <span class="status-text" id="pagination-text">0 resultados</span>
+            <button class="ghost-button" id="page-next" type="button">Siguiente</button>
+          </div>
+        </div>
+
+        <div id="analytics-table-container"></div>
+      </section>
+    </div>
+
+    <script src="/static/analytics.js" defer></script>
+  </body>
+</html>

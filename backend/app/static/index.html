@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agente de Analisis CSV</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <aside class="panel sidebar">
+        <div class="brand-block">
+          <p class="eyebrow">Agente CSV</p>
+          <h1>Sube un dataset y conversa con tus datos</h1>
+          <p class="muted">
+            Carga un CSV, elige el dataset activo y pregunta en lenguaje natural.
+          </p>
+        </div>
+
+        <section class="card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Carga</p>
+              <h2>Nuevo CSV</h2>
+            </div>
+            <span class="badge" id="upload-status-badge">Listo</span>
+          </div>
+
+          <form id="upload-form" class="stack">
+            <label class="field">
+              <span>Archivo CSV</span>
+              <input id="upload-file" name="file" type="file" accept=".csv,text/csv" required />
+            </label>
+
+            <label class="field">
+              <span>Nombre visible</span>
+              <input
+                id="upload-display-name"
+                name="display_name"
+                type="text"
+                placeholder="Ej. Ventas Q1 2026"
+              />
+            </label>
+
+            <button class="primary-button" id="upload-submit" type="submit">Subir dataset</button>
+            <p class="status-text" id="upload-status-text">Selecciona un CSV para empezar.</p>
+          </form>
+        </section>
+
+        <section class="card datasets-card">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Catalogo</p>
+              <h2>Datasets</h2>
+            </div>
+            <button class="ghost-button" id="refresh-datasets" type="button">Actualizar</button>
+          </div>
+
+          <div class="dataset-list" id="dataset-list"></div>
+        </section>
+
+        <section class="card" id="selected-dataset-card">
+          <div class="empty-state compact">
+            <h3>Selecciona un dataset</h3>
+            <p>Al cargar o elegir un CSV veras aqui su resumen operativo.</p>
+          </div>
+        </section>
+      </aside>
+
+      <main class="panel chat-panel">
+        <header class="chat-header">
+          <div>
+            <p class="eyebrow">Chat</p>
+            <h2>Consulta al agente</h2>
+          </div>
+          <div class="header-actions">
+            <div class="selected-chip" id="active-dataset-chip">Sin dataset seleccionado</div>
+            <a class="ghost-button" id="analytics-link" href="/analytics">Ver metricas</a>
+            <button class="ghost-button" id="clear-chat" type="button" title="Limpiar chat">Limpiar</button>
+          </div>
+        </header>
+
+        <section class="chat-transcript" id="chat-transcript"></section>
+
+        <section class="card prompt-card">
+          <div class="suggestions" id="suggestions"></div>
+
+          <form id="query-form" class="composer">
+            <textarea
+              id="query-input"
+              rows="2"
+              placeholder="Pregunta algo como: resumen general, tendencia mensual o top 5 por categoria"
+            ></textarea>
+            <div class="composer-actions">
+              <p class="status-text" id="query-status-text">Selecciona un dataset para habilitar el chat.</p>
+              <button class="primary-button" id="query-submit" type="submit" disabled>Enviar</button>
+            </div>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <template id="message-template">
+      <article class="message">
+        <div class="message-label"></div>
+        <div class="message-body"></div>
+      </article>
+    </template>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

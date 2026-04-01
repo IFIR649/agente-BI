@@ -203,7 +203,240 @@ Summary Writer [=====]                             15% (~800 tokens)
 
 ---
 
-## 7. Archivos Clave
+---
+
+## 7. Implementacion
+
+Las optimizaciones se implementan de menor a mayor complejidad. Cada paso es independiente y reversible.
+
+---
+
+### Paso 1 — Ajustes triviales de configuracion
+
+**Archivo:** `backend/app/config.py`
+
+Dos cambios de una linea cada uno:
+
+```python
+# Linea 33 — aumentar TTL del cache de respuestas de 5 a 10 minutos
+cache_ttl_seconds: int = 600  # era 300
+
+# Linea 39 — modelo mas barato para el summary writer
+# (se usara en summary_writer.py al agregar la nueva clave)
+gemini_lite_model: str = "gemini-2.5-flash-lite"
+```
+
+---
+
+### Paso 2 — Usar Flash Lite en Summary Writer
+
+**Archivo:** `backend/app/services/summary_writer.py`
+
+El `SummaryWriter` genera 1-2 oraciones a partir de KPIs ya calculados. Es la tarea mas simple del sistema. Cambio en la linea 46:
+
+```python
+# Antes (linea 46):
+model=self.settings.gemini_flash_model,
+
+# Despues:
+model=self.settings.gemini_lite_model,
+```
+
+Solo se necesita que `Settings` tenga la nueva clave `gemini_lite_model` del Paso 1.
+
+---
+
+### Paso 3 — Comprimir el catalogo en Intent Parser
+
+**Archivo:** `backend/app/services/intent_parser.py`  
+**Metodo:** `_build_system_instruction` (lineas 98-141)
+
+Se eliminan campos que el modelo no usa para tomar decisiones de plan, y se limita el historial.
+
+**3a. Reducir campos de columna** — lineas 106-118:
+
+```python
+# Antes: envia 8 campos por columna
+{
+    "name": name,
+    "type": column.type,
+    "label": column.label,
+    "semantic_role": column.semantic_role,
+    "non_null_ratio": round(column.non_null_ratio, 3),   # <-- eliminar
+    "uniqueness_ratio": round(column.uniqueness_ratio, 3), # <-- eliminar
+    "boolean_like": column.boolean_like,                   # <-- eliminar
+    "min": column.min_value,
+    "max": column.max_value,
+}
+
+# Despues: 5 campos por columna (min/max solo si es columna de fecha o numerica)
+{
+    "name": name,
+    "type": column.type,
+    "label": column.label,
+    "semantic_role": column.semantic_role,
+    **({"min": column.min_value, "max": column.max_value}
+       if column.semantic_role in ("time", "measure") else {}),
+}
+```
+
+**3b. Eliminar aliases del catalogo** — linea 139:
+
+Los aliases se usan en Python para normalizar la pregunta *antes* de enviarla a Gemini (ver `core/utils.py`). El modelo no necesita ver el mapa raw.
+
+```python
+# Antes (linea 139):
+"aliases": catalog.aliases,
+
+# Despues: eliminar esta linea completa
+# (catalog.aliases sigue usandose en _finalize_plan para resolver nombres)
+```
+
+**3c. Reducir sample_rows de 3 a 1** — linea 140:
+
+```python
+# Antes:
+"sample_rows": catalog.sample_rows[:3],
+
+# Despues:
+"sample_rows": catalog.sample_rows[:1],
+```
+
+**3d. Reducir historial de 6 a 3 turnos** — linea 171:
+
+```python
+# Antes:
+recent = history[-6:]
+
+# Despues:
+recent = history[-3:]
+```
+
+---
+
+### Paso 4 — Context Caching de la API de Gemini (mayor impacto)
+
+**Archivos a modificar:**
+- `backend/app/core/gemini_client.py` — agregar metodo `create_cached_content` y soporte para `cached_content_name` en `generate_structured_result`
+- `backend/app/services/intent_parser.py` — cachear el system instruction por `catalog_version`
+
+**Como funciona:** La API de Gemini permite enviar el system instruction una sola vez y obtener un `cache_name`. Las llamadas subsecuentes referencian ese nombre en lugar de reenviar el texto completo. El costo baja de $0.30/M a $0.03/M para los tokens cacheados. Duracion minima: 1 hora.
+
+**4a. Agregar metodo en `gemini_client.py`** (despues de `__init__`):
+
+```python
+def create_cached_content(
+    self,
+    *,
+    system_instruction: str,
+    model: str,
+    ttl_hours: int = 2,
+) -> str:
+    """Crea un cached content en Gemini y retorna su nombre (cache_name)."""
+    genai, types = self._load_sdk()
+    client = genai.Client(api_key=self.settings.gemini_api_key)
+    cached = client.caches.create(
+        model=model,
+        config=types.CreateCachedContentConfig(
+            system_instruction=system_instruction,
+            ttl=f"{ttl_hours * 3600}s",
+        ),
+    )
+    return cached.name  # ej: "cachedContents/abc123"
+```
+
+**4b. Modificar `generate_structured_result` en `gemini_client.py`** para aceptar `cached_content_name` opcional:
+
+```python
+def generate_structured_result(
+    self,
+    *,
+    system_instruction: str,
+    prompt: str,
+    response_model: type[T],
+    model: str,
+    temperature: float,
+    cached_content_name: str | None = None,  # <-- nuevo parametro
+) -> GeminiCallResult:
+    ...
+    config_kwargs = {
+        "temperature": temperature,
+        "response_mime_type": "application/json",
+        "response_schema": response_model,
+    }
+    if cached_content_name:
+        config_kwargs["cached_content"] = cached_content_name
+        # NO enviar system_instruction cuando hay cached_content
+    else:
+        config_kwargs["system_instruction"] = system_instruction
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
+```
+
+**4c. Cache de `cache_name` por dataset en `intent_parser.py`:**
+
+El cache name se guarda en un dict en memoria keyed por `(catalog.id, catalog.catalog_version)`. Se crea la primera vez y se reutiliza hasta que expire.
+
+```python
+class IntentParser:
+    def __init__(self, settings: Settings, gemini_client: GeminiClient) -> None:
+        self.settings = settings
+        self.gemini_client = gemini_client
+        self._gemini_cache: dict[tuple[str, str], str] = {}  # (catalog_id, version) -> cache_name
+
+    def _get_or_create_cache(self, catalog: DatasetCatalog) -> str | None:
+        """Retorna un cache_name de Gemini para el system instruction de este catalogo."""
+        key = (catalog.id, catalog.catalog_version)
+        if key in self._gemini_cache:
+            return self._gemini_cache[key]
+        try:
+            cache_name = self.gemini_client.create_cached_content(
+                system_instruction=self._build_system_instruction(catalog),
+                model=self.settings.gemini_flash_model,
+                ttl_hours=2,
+            )
+            self._gemini_cache[key] = cache_name
+            logger.info("gemini_cache created catalog_id=%s version=%s name=%s",
+                        catalog.id, catalog.catalog_version, cache_name)
+            return cache_name
+        except Exception as exc:
+            logger.warning("gemini_cache create failed: %s — fallback to no cache", exc)
+            return None
+
+    def parse(self, ...) -> AgentDecision:
+        ...
+        cache_name = self._get_or_create_cache(catalog)
+
+        result = self.gemini_client.generate_structured_result(
+            system_instruction=self._build_system_instruction(catalog),
+            prompt=prompt,
+            response_model=StructuredAgentDecision,
+            model=model_name,
+            temperature=self.settings.gemini_temperature_intent,
+            cached_content_name=cache_name,  # None si fallo la creacion
+        )
+```
+
+> **Nota:** El Context Caching de Gemini tiene un minimo de 1,024 tokens para activarse. Con cualquier dataset de mas de ~12 columnas ya supera ese umbral.
+
+---
+
+### Orden de implementacion recomendado
+
+| Paso | Archivo | Esfuerzo | Ahorro tokens |
+|---|---|---|---|
+| 1 | `config.py` | 5 min | Indirecto |
+| 2 | `summary_writer.py` | 2 min | 66% costo summary |
+| 3a-3d | `intent_parser.py` | 20 min | 15-25% intent |
+| 4 | `gemini_client.py` + `intent_parser.py` | 1-2 h | 70-80% intent |
+
+---
+
+## 8. Archivos Clave
 
 | Archivo | Rol | Llamadas Gemini |
 |---|---|---|

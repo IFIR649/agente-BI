@@ -1,7 +1,3 @@
-const STORAGE_KEYS = {
-  selectedDatasetId: "csv-agent-selected-dataset-id",
-};
-
 const state = {
   datasets: [],
   filters: {
@@ -102,11 +98,7 @@ async function loadDatasets() {
 
   if (state.filters.datasetId && !state.datasets.some((dataset) => dataset.id === state.filters.datasetId)) {
     state.filters.datasetId = "";
-    window.localStorage.removeItem(STORAGE_KEYS.selectedDatasetId);
     elements.dataset.value = "";
-  }
-  if (state.filters.datasetId) {
-    window.localStorage.setItem(STORAGE_KEYS.selectedDatasetId, state.filters.datasetId);
   }
   updateDatasetChip();
 }
@@ -179,18 +171,12 @@ async function loadAnalyticsData() {
 function applyFilters({ resetOffset }) {
   syncStateFromControls();
   if (resetOffset) state.offset = 0;
-  if (state.filters.datasetId) {
-    window.localStorage.setItem(STORAGE_KEYS.selectedDatasetId, state.filters.datasetId);
-  } else {
-    window.localStorage.removeItem(STORAGE_KEYS.selectedDatasetId);
-  }
   loadAnalyticsData();
 }
 
 function hydrateStateFromUrl() {
   const params = new URLSearchParams(window.location.search);
-  const storedDatasetId = window.localStorage.getItem(STORAGE_KEYS.selectedDatasetId) || "";
-  state.filters.datasetId = params.get("dataset_id") || storedDatasetId;
+  state.filters.datasetId = params.get("dataset_id") || "";
   state.filters.status = params.get("status") || "";
   state.filters.cacheHit = params.get("cache_hit") || "";
   state.filters.userId = params.get("user_id") || "";

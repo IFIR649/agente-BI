@@ -119,31 +119,55 @@ class DatasetProfiler:
         catalog_path = self.settings.catalogs_dir / f"{dataset_id}.json"
         if not catalog_path.exists():
             return None
-        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
-        catalog = DatasetCatalog.model_validate(payload)
-        return self._refresh_catalog_if_needed(catalog)
+        return self._load_catalog(catalog_path)
 
     def list_catalogs(self) -> list[DatasetSummary]:
         catalogs: list[DatasetSummary] = []
         for path in sorted(self.settings.catalogs_dir.glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            catalog = DatasetCatalog.model_validate(payload)
-            catalogs.append(self._refresh_catalog_if_needed(catalog).to_summary())
+            catalog = self._load_catalog(path)
+            if catalog is not None:
+                catalogs.append(catalog.to_summary())
         return sorted(catalogs, key=lambda item: item.created_at, reverse=True)
 
     def _save_catalog(self, catalog: DatasetCatalog) -> None:
         target = self.settings.catalogs_dir / f"{catalog.id}.json"
         target.write_text(
-            json.dumps(catalog.model_dump(mode="json"), ensure_ascii=True, indent=2),
+            json.dumps(catalog.model_dump(mode="json", exclude_none=True), ensure_ascii=True, indent=2),
             encoding="utf-8",
         )
 
-    def _refresh_catalog_if_needed(self, catalog: DatasetCatalog) -> DatasetCatalog:
+    def _load_catalog(self, catalog_path: Path) -> DatasetCatalog | None:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog = DatasetCatalog.model_validate(payload)
+        catalog, normalized = self._normalize_catalog(catalog)
+        csv_path = catalog.resolve_csv_path(data_dir=self.settings.data_dir)
+        if csv_path is None:
+            return None
+
+        refreshed = self._refresh_catalog_if_needed(catalog, csv_path=csv_path)
+        if refreshed is not catalog:
+            return refreshed
+        if normalized:
+            self._save_catalog(catalog)
+        return catalog
+
+    def _normalize_catalog(self, catalog: DatasetCatalog) -> tuple[DatasetCatalog, bool]:
+        updates: dict[str, str | None] = {}
+        logical_path = catalog.canonical_logical_path(data_dir=self.settings.data_dir)
+        if logical_path is not None and catalog.logical_path != logical_path:
+            updates["logical_path"] = logical_path
+        if logical_path is not None and catalog.storage_path is not None:
+            updates["storage_path"] = None
+        if not updates:
+            return catalog, False
+        return catalog.model_copy(update=updates), True
+
+    def _refresh_catalog_if_needed(self, catalog: DatasetCatalog, *, csv_path: Path) -> DatasetCatalog:
         if not self._catalog_needs_refresh(catalog):
             return catalog
         refreshed = self._build_catalog(
             dataset_id=catalog.id,
-            csv_path=Path(catalog.storage_path),
+            csv_path=csv_path,
             original_filename=catalog.filename,
             metadata=UploadMetadata(
                 display_name=catalog.display_name,
@@ -234,8 +258,7 @@ class DatasetProfiler:
             filename=original_filename,
             display_name=metadata.display_name or Path(original_filename).stem,
             description=metadata.description,
-            storage_path=str(csv_path.resolve()),
-            logical_path=f"uploads/{dataset_id}.csv",
+            logical_path=(Path("uploads") / csv_path.name).as_posix(),
             row_count=row_count,
             columns=columns,
             date_columns=date_columns,
@@ -258,6 +281,9 @@ class DatasetProfiler:
         catalog = self.get_catalog(dataset_id)
         if catalog is None:
             return None
+        csv_path = catalog.resolve_csv_path(data_dir=self.settings.data_dir)
+        if csv_path is None:
+            return None
 
         invalid_columns = sorted(set(column_labels) - set(catalog.columns))
         if invalid_columns:
@@ -272,7 +298,7 @@ class DatasetProfiler:
 
         updated = self._build_catalog(
             dataset_id=catalog.id,
-            csv_path=Path(catalog.storage_path),
+            csv_path=csv_path,
             original_filename=catalog.filename,
             metadata=UploadMetadata(
                 display_name=catalog.display_name,

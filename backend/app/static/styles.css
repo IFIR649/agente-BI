@@ -44,12 +44,26 @@ button { cursor: pointer; }
   padding: 18px;
 }
 
+.prod-shell {
+  min-height: 100vh;
+  max-width: 1120px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px;
+}
+
 .sidebar,
 .chat-panel {
   display: flex;
   flex-direction: column;
   gap: 18px;
   min-height: 0;
+}
+
+.prod-header {
+  margin-top: 0;
 }
 
 /* ─── Cards & surfaces ──────────────────────────────────────────────────── */
@@ -67,6 +81,23 @@ button { cursor: pointer; }
 .card {
   border-radius: var(--radius-xl);
   padding: 20px;
+}
+
+.prod-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.prod-choice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.prod-choice-item {
+  width: 100%;
+  text-align: left;
 }
 
 .chat-transcript {

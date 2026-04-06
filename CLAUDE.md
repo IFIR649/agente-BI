@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-```bash
+```powershell
 # Backend (development)
-cd backend && uvicorn app.main:app --reload
+.\scripts\backend-dev.ps1
 
 # Backend tests
-cd backend && pytest tests/
+.\scripts\backend-test.ps1
 
 # Frontend (development)
 cd frontend && npm run dev
@@ -20,6 +20,8 @@ cd frontend && npm run build
 # Docker (full stack)
 docker-compose up --build
 ```
+
+Backend commands must run through the repo-local interpreter at `.\env\Scripts\python.exe`.
 
 ## Architecture
 

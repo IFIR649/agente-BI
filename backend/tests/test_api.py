@@ -25,7 +25,18 @@ def test_root_endpoint(client: TestClient) -> None:
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert "Agente de Analisis CSV" in response.text
+    assert "/static/root.js" in response.text
+    assert "Consulta al agente" in response.text
+    assert "Ver metricas" not in response.text
+
+
+def test_test_ui_endpoint(client: TestClient) -> None:
+    response = client.get("/test")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Agente de Analisis CSV" in response.text
     assert "/static/app.js" in response.text
+    assert "Ver metricas" in response.text
 
 
 def test_analytics_endpoint(client: TestClient) -> None:
@@ -42,6 +53,7 @@ def test_api_info_endpoint(client: TestClient) -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["ui_url"] == "/"
+    assert payload["test_ui_url"] == "/test"
     assert payload["analytics_ui_url"] == "/analytics"
     assert payload["docs_url"] == "/docs"
     assert payload["metrics_queries_url"] == "/metrics/queries"
@@ -148,6 +160,10 @@ def test_static_assets_are_served(client: TestClient) -> None:
     assert response.status_code == 200
     assert "javascript" in response.headers["content-type"]
 
+    root = client.get("/static/root.js")
+    assert root.status_code == 200
+    assert "javascript" in root.headers["content-type"]
+
     analytics = client.get("/static/analytics.js")
     assert analytics.status_code == 200
     assert "javascript" in analytics.headers["content-type"]
@@ -168,6 +184,100 @@ def test_upload_and_list_datasets(client: TestClient, uploaded_shape_dataset: di
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["id"] == dataset_id
+
+
+def test_uploaded_catalog_persists_relative_logical_path(app, uploaded_shape_dataset: dict) -> None:
+    dataset_id = uploaded_shape_dataset["id"]
+    catalog_path = app.state.settings.catalogs_dir / f"{dataset_id}.json"
+    payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+
+    assert payload["logical_path"] == f"uploads/{dataset_id}.csv"
+    assert "storage_path" not in payload
+
+
+def test_get_active_dataset_returns_404_without_active(client: TestClient) -> None:
+    response = client.get("/datasets/active", headers={"X-User-Id": "usr_missing_active"})
+    assert response.status_code == 404
+    assert "No hay dataset activo" in response.json()["detail"]
+
+
+def test_upload_sets_active_dataset_for_user(client: TestClient) -> None:
+    upload = client.post(
+        "/datasets/upload",
+        headers={"X-User-Id": "usr_upload_active"},
+        files={"file": ("shape.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n", "text/csv")},
+        data={"metadata": json.dumps({"display_name": "Dataset Activo"})},
+    )
+    assert upload.status_code == 201, upload.text
+
+    active = client.get("/datasets/active", headers={"X-User-Id": "usr_upload_active"})
+    assert active.status_code == 200, active.text
+    payload = active.json()
+    assert payload["id"] == upload.json()["id"]
+    assert payload["display_name"] == "Dataset Activo"
+
+
+def test_set_active_dataset_endpoint_switches_dataset(client: TestClient) -> None:
+    first = client.post(
+        "/datasets/upload",
+        headers={"X-User-Id": "usr_switch"},
+        files={"file": ("one.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n", "text/csv")},
+        data={"metadata": json.dumps({"display_name": "Uno"})},
+    )
+    second = client.post(
+        "/datasets/upload",
+        headers={"X-User-Id": "usr_switch"},
+        files={"file": ("two.csv", "time_axis,group_axis,measure_axis\n2026-01-02,beta,150\n", "text/csv")},
+        data={"metadata": json.dumps({"display_name": "Dos"})},
+    )
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+
+    switched = client.put(
+        "/datasets/active",
+        headers={"X-User-Id": "usr_switch"},
+        json={"dataset_id": first.json()["id"]},
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["id"] == first.json()["id"]
+
+    active = client.get("/datasets/active", headers={"X-User-Id": "usr_switch"})
+    assert active.status_code == 200, active.text
+    assert active.json()["id"] == first.json()["id"]
+
+
+def test_set_active_dataset_returns_404_for_missing_dataset(client: TestClient) -> None:
+    response = client.put(
+        "/datasets/active",
+        headers={"X-User-Id": "usr_missing_dataset"},
+        json={"dataset_id": "missing-dataset"},
+    )
+    assert response.status_code == 404
+    assert "Dataset no encontrado" in response.json()["detail"]
+
+
+def test_active_dataset_is_isolated_by_user(client: TestClient) -> None:
+    first = client.post(
+        "/datasets/upload",
+        headers={"X-User-Id": "usr_a"},
+        files={"file": ("a.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n", "text/csv")},
+        data={"metadata": json.dumps({"display_name": "Dataset A"})},
+    )
+    second = client.post(
+        "/datasets/upload",
+        headers={"X-User-Id": "usr_b"},
+        files={"file": ("b.csv", "time_axis,group_axis,measure_axis\n2026-01-02,beta,150\n", "text/csv")},
+        data={"metadata": json.dumps({"display_name": "Dataset B"})},
+    )
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+
+    active_a = client.get("/datasets/active", headers={"X-User-Id": "usr_a"})
+    active_b = client.get("/datasets/active", headers={"X-User-Id": "usr_b"})
+    assert active_a.status_code == 200
+    assert active_b.status_code == 200
+    assert active_a.json()["id"] == first.json()["id"]
+    assert active_b.json()["id"] == second.json()["id"]
 
 
 def test_multi_time_dataset_picks_structural_default_date(client: TestClient, uploaded_multi_time_dataset: dict) -> None:
@@ -870,6 +980,100 @@ def test_old_catalogs_refresh_labels_and_day_of_week(client: TestClient, app, up
     assert catalog is not None
     assert "time_axis_day_of_week" in catalog.dimension_definitions
     assert catalog.dimension_definitions["time_axis_day_of_week"].order_expression is not None
+
+
+def test_old_catalog_with_invalid_storage_path_uses_relative_upload(client: TestClient, app, uploaded_shape_dataset: dict) -> None:
+    dataset_id = uploaded_shape_dataset["id"]
+    catalog_path = app.state.settings.catalogs_dir / f"{dataset_id}.json"
+    payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    payload["storage_path"] = rf"C:\n8n\agente-web\backend\app\data\uploads\{dataset_id}.csv"
+    catalog_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    listed = client.get("/datasets")
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["id"] == dataset_id
+
+    activated = client.put(
+        "/datasets/active",
+        headers={"X-User-Id": "usr_legacy_catalog"},
+        json={"dataset_id": dataset_id},
+    )
+    assert activated.status_code == 200, activated.text
+
+    active = client.get("/datasets/active", headers={"X-User-Id": "usr_legacy_catalog"})
+    assert active.status_code == 200, active.text
+    assert active.json()["id"] == dataset_id
+
+    queue_fake_gemini(
+        app,
+        structured=[
+            AgentDecision(
+                kind="query",
+                plan=QueryPlan(
+                    intent="aggregate_report",
+                    dimensions=["group_axis"],
+                    metrics=["measure_axis_sum"],
+                    sort=SortSpec(field="measure_axis_sum", order="desc"),
+                    visualization="bar",
+                    confidence=0.96,
+                ),
+            )
+        ],
+        texts=["Resumen migrado."],
+    )
+
+    response = client.post(
+        "/query",
+        json={"dataset_id": dataset_id, "question": "ventas por grupo"},
+        headers={"X-User-Id": "usr_legacy_catalog"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ok"
+
+    normalized = json.loads(catalog_path.read_text(encoding="utf-8"))
+    assert normalized["logical_path"] == f"uploads/{dataset_id}.csv"
+    assert "storage_path" not in normalized
+
+
+def test_catalog_without_logical_path_is_recovered_from_uploads(app, uploaded_shape_dataset: dict) -> None:
+    dataset_id = uploaded_shape_dataset["id"]
+    catalog_path = app.state.settings.catalogs_dir / f"{dataset_id}.json"
+    payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    payload.pop("logical_path", None)
+    payload["storage_path"] = rf"C:\n8n\agente-web\backend\app\data\uploads\{dataset_id}.csv"
+    catalog_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    catalog = app.state.dataset_profiler.get_catalog(dataset_id)
+    assert catalog is not None
+    assert catalog.logical_path == f"uploads/{dataset_id}.csv"
+
+    normalized = json.loads(catalog_path.read_text(encoding="utf-8"))
+    assert normalized["logical_path"] == f"uploads/{dataset_id}.csv"
+    assert "storage_path" not in normalized
+
+
+def test_unrecoverable_catalog_becomes_unavailable_for_active_user(client: TestClient, app) -> None:
+    upload = client.post(
+        "/datasets/upload",
+        headers={"X-User-Id": "usr_missing_file"},
+        files={"file": ("shape.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n", "text/csv")},
+        data={"metadata": json.dumps({"display_name": "Dataset Invalido"})},
+    )
+    assert upload.status_code == 201, upload.text
+    dataset_id = upload.json()["id"]
+
+    csv_path = app.state.settings.uploads_dir / f"{dataset_id}.csv"
+    csv_path.unlink()
+
+    catalog_path = app.state.settings.catalogs_dir / f"{dataset_id}.json"
+    payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    payload.pop("logical_path", None)
+    payload["storage_path"] = rf"C:\n8n\agente-web\backend\app\data\uploads\{dataset_id}.csv"
+    catalog_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    active = client.get("/datasets/active", headers={"X-User-Id": "usr_missing_file"})
+    assert active.status_code == 404
+    assert "ya no esta disponible" in active.json()["detail"]
 
 
 def test_gemini_structured_schema_does_not_include_additional_properties() -> None:

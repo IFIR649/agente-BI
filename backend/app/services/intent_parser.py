@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from backend.app.config import Settings
 from backend.app.core.gemini_client import (
@@ -28,6 +28,8 @@ class IntentParser:
     def __init__(self, settings: Settings, gemini_client: GeminiClient) -> None:
         self.settings = settings
         self.gemini_client = gemini_client
+        self._cached_contents: dict[str, str] = {}
+        self._cache_failure_until: dict[str, datetime] = {}
 
     def parse(
         self,
@@ -322,13 +324,43 @@ class IntentParser:
         model: str,
         temperature: float,
     ):
+        cache_key = self._context_cache_key(catalog=catalog, model=model)
+        cached_content_name = self._cached_contents.get(cache_key)
+
+        if cached_content_name is None and not self._cache_failure_is_active(cache_key):
+            try:
+                cached_content_name = self.gemini_client.create_cached_content(
+                    system_instruction=system_instruction,
+                    model=model,
+                    ttl_hours=self.settings.gemini_context_cache_ttl_hours,
+                )
+                self._cached_contents[cache_key] = cached_content_name
+            except GeminiClientError:
+                self._cache_failure_until[cache_key] = datetime.now() + timedelta(
+                    seconds=self.settings.gemini_context_cache_failure_cooldown_seconds
+                )
+                cached_content_name = None
+
         return self.gemini_client.generate_structured_result(
             system_instruction=system_instruction,
             prompt=prompt,
             response_model=response_model,
             model=model,
             temperature=temperature,
+            cached_content_name=cached_content_name,
         )
+
+    def _context_cache_key(self, *, catalog: DatasetCatalog, model: str) -> str:
+        return f"{catalog.id}:{catalog.catalog_version}:{model}"
+
+    def _cache_failure_is_active(self, cache_key: str) -> bool:
+        until = self._cache_failure_until.get(cache_key)
+        if until is None:
+            return False
+        if until <= datetime.now():
+            self._cache_failure_until.pop(cache_key, None)
+            return False
+        return True
 
 
     def _build_system_instruction(self, catalog: DatasetCatalog) -> str:

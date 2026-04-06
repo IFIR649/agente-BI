@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.config import Settings, get_settings
+from backend.app.core.active_dataset import ActiveDatasetStore
 from backend.app.core.audit import AuditLogger
 from backend.app.core.cache import TTLCache
 from backend.app.core.database import DuckDBManager
@@ -57,6 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.cache = TTLCache(settings.cache_ttl_seconds)
     app.state.rate_limiter = InMemoryRateLimiter(settings.rate_limit_requests, settings.rate_limit_window_seconds)
     app.state.audit_logger = AuditLogger(settings.audit_db_path, fx_resolver=fx_resolver)
+    app.state.active_dataset_store = ActiveDatasetStore(settings.audit_db_path)
     app.state.dataset_profiler = DatasetProfiler(settings, db_manager, gemini_client)
     app.state.intent_parser = IntentParser(settings, gemini_client)
     app.state.query_executor = QueryExecutor(settings, db_manager)
@@ -69,6 +71,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def root() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/test")
+    async def test_ui() -> FileResponse:
+        return FileResponse(STATIC_DIR / "test.html")
+
     @app.get("/analytics")
     async def analytics() -> FileResponse:
         return FileResponse(STATIC_DIR / "analytics.html")
@@ -79,6 +85,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "status": "ok",
             "message": "CSV Analysis Agent API",
             "ui_url": "/",
+            "test_ui_url": "/test",
             "analytics_ui_url": "/analytics",
             "docs_url": "/docs",
             "health_url": "/health",

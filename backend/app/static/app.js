@@ -9,7 +9,6 @@ const state = {
 const palette = ["#166a63", "#d97a36", "#355c7d", "#8b5a2b", "#7a3b69", "#2d7a4f", "#a84a35"];
 const STORAGE_KEYS = {
   chatHistory: "chat-history",
-  selectedDatasetId: "csv-agent-selected-dataset-id",
   userId: "csv-agent-user-id",
 };
 
@@ -42,7 +41,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function bootstrap() {
   ensureUserId();
-  hydrateSelectedDatasetPreference();
   loadSessionHistory();
   if (!state.messages.length) {
     pushMessage({
@@ -51,6 +49,7 @@ async function bootstrap() {
     });
   }
   await loadDatasets();
+  await hydrateActiveDataset();
   updateComposerState();
 }
 
@@ -125,7 +124,6 @@ async function loadDatasets() {
       state.selectedDatasetId = datasets[0]?.id ?? null;
     }
 
-    persistSelectedDataset();
     renderDatasets();
     renderSelectedDataset();
     updateComposerState();
@@ -136,6 +134,51 @@ async function loadDatasets() {
     renderDatasetsError(error.message);
     setUploadStatus(error.message, "error", "Error");
   }
+}
+
+async function hydrateActiveDataset() {
+  try {
+    const response = await fetch("/datasets/active", {
+      headers: { "X-User-Id": ensureUserId() },
+    });
+    const payload = await parseJsonResponse(response);
+    if (response.status === 404) {
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(payload.detail || "No se pudo cargar el dataset activo.");
+    }
+
+    state.selectedDatasetId = payload.id;
+    renderDatasets();
+    renderSelectedDataset();
+    updateComposerState();
+    updateAnalyticsLink();
+  } catch (error) {
+    setUploadStatus(error.message, "error", "Error");
+  }
+}
+
+async function setActiveDataset(datasetId) {
+  const response = await fetch("/datasets/active", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Id": ensureUserId(),
+    },
+    body: JSON.stringify({ dataset_id: datasetId }),
+  });
+  const payload = await parseJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(payload.detail || "No se pudo activar el dataset.");
+  }
+
+  state.selectedDatasetId = payload.id;
+  renderDatasets();
+  renderSelectedDataset();
+  updateComposerState();
+  updateAnalyticsLink();
+  return payload;
 }
 
 async function handleUploadSubmit(event) {
@@ -158,12 +201,15 @@ async function handleUploadSubmit(event) {
     const displayName = elements.uploadDisplayName.value.trim();
     if (displayName) formData.append("metadata", JSON.stringify({ display_name: displayName }));
 
-    const response = await fetch("/datasets/upload", { method: "POST", body: formData });
+    const response = await fetch("/datasets/upload", {
+      method: "POST",
+      headers: { "X-User-Id": ensureUserId() },
+      body: formData,
+    });
     const payload = await parseJsonResponse(response);
     if (!response.ok) throw new Error(payload.detail || "No se pudo subir el dataset.");
 
     state.selectedDatasetId = payload.id;
-    persistSelectedDataset();
     await loadDatasets();
     elements.uploadForm.reset();
     setUploadStatus(`Dataset listo: ${payload.display_name} (${formatNumber(payload.row_count)} filas)`, "success", "Listo");
@@ -190,12 +236,14 @@ async function handleQuerySubmit(event) {
   if (!selectedDataset || !question) return;
 
   state.isSubmitting = true;
-  updateComposerState("Interpretando tu pregunta...");
-  pushMessage({ role: "user", text: question });
-  const thinkingId = pushMessage({ role: "thinking", text: renderThinkingMarkup(), html: true });
-  elements.queryInput.value = "";
+  let thinkingId = null;
 
   try {
+    updateComposerState("Interpretando tu pregunta...");
+    pushMessage({ role: "user", text: question });
+    thinkingId = pushMessage({ role: "thinking", text: renderThinkingMarkup(), html: true });
+    elements.queryInput.value = "";
+
     const response = await fetch("/query", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-User-Id": ensureUserId() },
@@ -247,8 +295,10 @@ async function handleQuerySubmit(event) {
       throw new Error("La API devolvio un estado desconocido.");
     }
   } catch (error) {
-    removeMessage(thinkingId);
-    pushMessage({ role: "system", text: error.message });
+    if (thinkingId) {
+      removeMessage(thinkingId);
+    }
+    pushMessage({ role: "system", text: error?.message || "Ocurrio un error enviando tu consulta." });
   } finally {
     state.isSubmitting = false;
     updateComposerState();
@@ -560,11 +610,15 @@ function renderDatasets() {
       </div>
       <div class="dataset-meta">${escapeHtml(dataset.filename)}</div>
       <div class="dataset-meta">${dataset.metrics_allowed.length} metricas · ${dataset.dimensions_allowed.length} dimensiones</div>`;
-    button.addEventListener("click", () => {
-      setSelectedDataset(dataset.id);
-      renderDatasets();
-      renderSelectedDataset();
-      updateComposerState();
+    button.addEventListener("click", async () => {
+      try {
+        setUploadStatus("Actualizando dataset activo...", "warn", "Catalogo");
+        const active = await setActiveDataset(dataset.id);
+        setUploadStatus(`Dataset activo: ${active.display_name}`, "success", "Activo");
+      } catch (error) {
+        setUploadStatus(error.message, "error", "Error");
+        pushMessage({ role: "system", text: error.message });
+      }
     });
     elements.datasetList.appendChild(button);
   }
@@ -764,7 +818,7 @@ function setUploadStatus(text, tone, badgeLabel) {
 }
 
 function pushMessage(message) {
-  const id = crypto.randomUUID();
+  const id = generateId();
   state.messages.push({ id, ...message });
   renderChat();
   return id;
@@ -777,25 +831,6 @@ function removeMessage(messageId) {
 
 function getSelectedDataset() {
   return state.datasets.find((d) => d.id === state.selectedDatasetId) || null;
-}
-
-function hydrateSelectedDatasetPreference() {
-  const stored = window.localStorage.getItem(STORAGE_KEYS.selectedDatasetId);
-  if (stored) state.selectedDatasetId = stored;
-}
-
-function persistSelectedDataset() {
-  if (state.selectedDatasetId) {
-    window.localStorage.setItem(STORAGE_KEYS.selectedDatasetId, state.selectedDatasetId);
-  } else {
-    window.localStorage.removeItem(STORAGE_KEYS.selectedDatasetId);
-  }
-}
-
-function setSelectedDataset(datasetId) {
-  state.selectedDatasetId = datasetId || null;
-  persistSelectedDataset();
-  updateAnalyticsLink();
 }
 
 function buildHistoryPayload() {
@@ -814,7 +849,7 @@ function extractTextFromHtml(html) {
 function ensureUserId() {
   let userId = window.localStorage.getItem(STORAGE_KEYS.userId);
   if (!userId) {
-    userId = `web-${crypto.randomUUID()}`;
+    userId = `web-${generateId()}`;
     window.localStorage.setItem(STORAGE_KEYS.userId, userId);
   }
   return userId;
@@ -835,6 +870,33 @@ function labelForRole(role, subtitle) {
 
 function renderThinkingMarkup() {
   return `<span class="typing-dots" aria-label="Pensando"><span></span><span></span><span></span></span>`;
+}
+
+function generateId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch (_) {}
+
+  try {
+    if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+      return [
+        hex.slice(0, 4).join(""),
+        hex.slice(4, 6).join(""),
+        hex.slice(6, 8).join(""),
+        hex.slice(8, 10).join(""),
+        hex.slice(10, 16).join(""),
+      ].join("-");
+    }
+  } catch (_) {}
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 // ─── Parse/format helpers ──────────────────────────────────────────────────

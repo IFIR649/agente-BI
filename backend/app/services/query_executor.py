@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from datetime import date, timedelta
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -35,8 +34,12 @@ class QueryExecutor:
             "execute dataset=%s intent=%s metrics=%s dimensions=%s",
             catalog.id, plan.intent, plan.metrics, plan.dimensions,
         )
+        csv_path = catalog.resolve_csv_path(data_dir=self.settings.data_dir)
+        if csv_path is None:
+            raise FileNotFoundError(f"No se encontro el archivo del dataset {catalog.id}.")
+
         with self.db_manager.session() as connection:
-            self.db_manager.register_csv_view(connection, Path(catalog.storage_path))
+            self.db_manager.register_csv_view(connection, csv_path)
 
             rows = self._execute_main_query(connection, catalog=catalog, plan=plan)
             current_totals = self._execute_totals_query(connection, catalog=catalog, filters=plan.filters, metrics=plan.metrics)

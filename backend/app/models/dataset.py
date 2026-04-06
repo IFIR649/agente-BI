@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,6 +12,19 @@ SemanticRole = Literal["time", "measure", "flag", "category", "identifier", "unk
 DimensionKind = Literal["column", "time_granularity"]
 Granularity = Literal["day", "week", "month", "year", "day_of_week"]
 MetricAggregator = Literal["sum", "avg", "min", "max", "count"]
+_UPLOADS_DIR = Path("uploads")
+
+
+def _normalize_logical_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.lstrip("/")
+    if normalized.startswith("data/"):
+        normalized = normalized[len("data/"):]
+    return normalized or None
 
 
 class ColumnProfile(BaseModel):
@@ -67,8 +81,8 @@ class DatasetCatalog(BaseModel):
     filename: str
     display_name: str
     description: str | None = None
-    storage_path: str
-    logical_path: str
+    storage_path: str | None = None
+    logical_path: str | None = None
     row_count: int
     columns: dict[str, ColumnProfile]
     date_columns: list[str] = Field(default_factory=list)
@@ -90,13 +104,45 @@ class DatasetCatalog(BaseModel):
     def metrics_index(self) -> dict[str, MetricDefinition]:
         return {metric.name: metric for metric in self.metrics_allowed}
 
+    def canonical_logical_path(self, *, data_dir: Path) -> str | None:
+        normalized = _normalize_logical_path(self.logical_path)
+        if normalized is not None:
+            return normalized
+
+        legacy_filename = Path(self.storage_path).name if self.storage_path else ""
+        if legacy_filename:
+            legacy_candidate = _UPLOADS_DIR / legacy_filename
+            if (data_dir / legacy_candidate).exists():
+                return legacy_candidate.as_posix()
+
+        fallback_candidate = _UPLOADS_DIR / f"{self.id}.csv"
+        if (data_dir / fallback_candidate).exists():
+            return fallback_candidate.as_posix()
+        return None
+
+    def resolve_csv_path(self, *, data_dir: Path) -> Path | None:
+        logical_path = _normalize_logical_path(self.logical_path)
+        if logical_path is not None:
+            candidate = data_dir / Path(logical_path)
+            return candidate if candidate.exists() else None
+
+        recovered_logical_path = self.canonical_logical_path(data_dir=data_dir)
+        if recovered_logical_path is None:
+            return None
+
+        candidate = data_dir / Path(recovered_logical_path)
+        return candidate if candidate.exists() else None
+
     def to_summary(self) -> "DatasetSummary":
+        logical_path = _normalize_logical_path(self.logical_path)
+        if logical_path is None:
+            raise ValueError("El catalogo no tiene logical_path disponible.")
         return DatasetSummary(
             id=self.id,
             filename=self.filename,
             display_name=self.display_name,
             description=self.description,
-            logical_path=self.logical_path,
+            logical_path=logical_path,
             row_count=self.row_count,
             columns=self.columns,
             date_columns=self.date_columns,

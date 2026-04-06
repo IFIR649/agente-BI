@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import time
@@ -71,6 +72,7 @@ class GeminiClient:
         response_model: type[T],
         model: str,
         temperature: float,
+        cached_content_name: str | None = None,
     ) -> T:
         result = self.generate_structured_result(
             system_instruction=system_instruction,
@@ -78,8 +80,44 @@ class GeminiClient:
             response_model=response_model,
             model=model,
             temperature=temperature,
+            cached_content_name=cached_content_name,
         )
         return result.payload
+
+    @functools.cached_property
+    def _client(self) -> Any:
+        genai, types = self._load_sdk()
+        return genai.Client(
+            api_key=self.settings.gemini_api_key,
+            http_options=types.HttpOptions(timeout=self.settings.gemini_timeout_seconds * 1000),
+        )
+
+    def create_cached_content(
+        self,
+        *,
+        system_instruction: str,
+        model: str,
+        ttl_hours: int = 2,
+    ) -> str:
+        if not self.configured:
+            raise GeminiUnavailableError("GEMINI_API_KEY no configurada.")
+
+        _, types = self._load_sdk()
+        try:
+            cached = self._client.caches.create(
+                model=model,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=system_instruction,
+                    ttl=f"{ttl_hours * 3600}s",
+                ),
+            )
+        except Exception as exc:  # pragma: no cover - external service
+            raise GeminiClientError(f"Error creando cache en Gemini: {exc}") from exc
+
+        cache_name = str(getattr(cached, "name", "") or "")
+        if not cache_name:
+            raise GeminiClientError("Gemini no devolvio un nombre de cache reutilizable.")
+        return cache_name
 
     def generate_structured_result(
         self,
@@ -89,24 +127,28 @@ class GeminiClient:
         response_model: type[T],
         model: str,
         temperature: float,
+        cached_content_name: str | None = None,
     ) -> GeminiCallResult:
         if not self.configured:
             raise GeminiUnavailableError("GEMINI_API_KEY no configurada.")
 
-        genai, types = self._load_sdk()
+        _, types = self._load_sdk()
         started_at = time.perf_counter()
 
         try:
-            client = genai.Client(api_key=self.settings.gemini_api_key)
-            response = client.models.generate_content(
+            config_kwargs: dict[str, Any] = {
+                "temperature": temperature,
+                "response_mime_type": "application/json",
+                "response_schema": response_model,
+            }
+            if cached_content_name:
+                config_kwargs["cached_content"] = cached_content_name
+            else:
+                config_kwargs["system_instruction"] = system_instruction
+            response = self._client.models.generate_content(
                 model=model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    response_schema=response_model,
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
         except Exception as exc:  # pragma: no cover - external service
             raise GeminiClientError(f"Error llamando Gemini: {exc}") from exc
@@ -161,12 +203,11 @@ class GeminiClient:
         if not self.configured:
             raise GeminiUnavailableError("GEMINI_API_KEY no configurada.")
 
-        genai, types = self._load_sdk()
+        _, types = self._load_sdk()
         started_at = time.perf_counter()
 
         try:
-            client = genai.Client(api_key=self.settings.gemini_api_key)
-            response = client.models.generate_content(
+            response = self._client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(

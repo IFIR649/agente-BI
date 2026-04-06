@@ -55,6 +55,7 @@ class QueuedGemini:
         self.text_queue: deque[Any] = deque()
         self.structured_calls: list[dict[str, Any]] = []
         self.text_calls: list[dict[str, Any]] = []
+        self.cache_create_calls: list[dict[str, Any]] = []
 
     def queue_structured(self, *items: Any) -> None:
         self.structured_queue.extend(items)
@@ -82,6 +83,10 @@ class QueuedGemini:
                 total_token_count=148,
             ),
         )
+
+    def create_cached_content(self, **_: object) -> str:
+        self.cache_create_calls.append(dict(_))
+        return f"cachedContents/fake-{len(self.cache_create_calls)}"
 
     def generate_text(self, **_: object) -> str:
         return self.generate_text_result(**_).payload
@@ -128,6 +133,9 @@ def build_settings(tmp_path: Path, *, rate_limit_requests: int = 20) -> Settings
         rate_limit_requests=rate_limit_requests,
         rate_limit_window_seconds=60,
         gemini_api_key="test-gemini-key",
+        gemini_flash_model="gemini-2.5-flash",
+        gemini_pro_model="gemini-2.5-flash",
+        gemini_lite_model="gemini-2.5-flash-lite",
         allow_local_gemini_fallback=False,
     )
 
@@ -135,6 +143,7 @@ def build_settings(tmp_path: Path, *, rate_limit_requests: int = 20) -> Settings
 def install_fake_gemini(app) -> QueuedGemini:
     fake = QueuedGemini()
     app.state._fake_gemini = fake
+    app.state.gemini_client.create_cached_content = fake.create_cached_content
     app.state.gemini_client.generate_structured = fake.generate_structured
     app.state.gemini_client.generate_structured_result = fake.generate_structured_result
     app.state.gemini_client.generate_text = fake.generate_text

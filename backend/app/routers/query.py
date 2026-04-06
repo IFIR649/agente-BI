@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Header, Request, status
 from fastapi.responses import JSONResponse
 
@@ -96,7 +98,8 @@ async def query_dataset(
 
     try:
         with collector.stage_timer("intent_ms"):
-            decision = request.app.state.intent_parser.parse(
+            decision = await asyncio.to_thread(
+                request.app.state.intent_parser.parse,
                 question=payload.question,
                 catalog=catalog,
                 history=payload.history,
@@ -167,7 +170,8 @@ async def query_dataset(
         with collector.stage_timer("response_build_ms"):
             built = request.app.state.response_builder.build(catalog=catalog, plan=plan, execution=execution)
         with collector.stage_timer("summary_ms"):
-            summary = request.app.state.summary_writer.write(
+            summary = await asyncio.to_thread(
+                request.app.state.summary_writer.write,
                 question=payload.question,
                 catalog=catalog,
                 kpis=built.kpis,

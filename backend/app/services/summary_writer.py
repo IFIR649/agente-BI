@@ -43,7 +43,7 @@ class SummaryWriter:
                 result = self.gemini_client.generate_text_result(
                     system_instruction=_SYSTEM_INSTRUCTION,
                     prompt=self._build_prompt(question=question, catalog=catalog, kpis=kpis, highlights=highlights, plan=plan),
-                    model=self.settings.gemini_flash_model,
+                    model=self.settings.gemini_lite_model,
                     temperature=self.settings.gemini_temperature_summary,
                 )
                 if telemetry_collector is not None:

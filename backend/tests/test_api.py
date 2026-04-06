@@ -15,8 +15,9 @@ from backend.app.core.gemini_client import GeminiClientError, GeminiResponseForm
 from backend.app.main import create_app
 from backend.app.models.intent import AgentDecision, QueryFilter, QueryPlan, SortSpec, StructuredAgentDecision
 from backend.app.models.telemetry import FXRateRecord, LLMCallTelemetry
+from backend.app.services.intent_parser import IntentParser
 from backend.app.services.dataset_profiler import ColumnLabelsResponse
-from backend.tests.conftest import build_settings, install_fake_gemini, queue_fake_gemini
+from backend.tests.conftest import FixedFXResolver, build_settings, install_fake_gemini, queue_fake_gemini
 
 
 def test_root_endpoint(client: TestClient) -> None:
@@ -290,6 +291,198 @@ def test_query_uses_human_labels_everywhere(client: TestClient, app) -> None:
     prompt = app.state._fake_gemini.text_calls[-1]["prompt"]
     assert "measure_axis_sum -> Total de Ventas Netas" in prompt
     assert "group_axis -> Sucursal" in prompt
+    assert app.state._fake_gemini.text_calls[-1]["model"] == "gemini-2.5-flash-lite"
+
+
+def test_intent_parser_compacts_catalog_payload(app, uploaded_shape_dataset: dict) -> None:
+    catalog = app.state.dataset_profiler.get_catalog(uploaded_shape_dataset["id"])
+    assert catalog is not None
+
+    parser: IntentParser = app.state.intent_parser
+    system_instruction = parser._build_system_instruction(catalog)
+    catalog_payload = json.loads(system_instruction.split("CATALOGO:\n", 1)[1])
+
+    assert "aliases" not in catalog_payload
+    assert len(catalog_payload["sample_rows"]) == 1
+    first_column = catalog_payload["columns"][0]
+    assert "non_null_ratio" not in first_column
+    assert "uniqueness_ratio" not in first_column
+    assert "boolean_like" not in first_column
+
+
+def test_intent_parser_uses_only_recent_history_and_alias_hints(app, uploaded_shape_dataset: dict) -> None:
+    catalog = app.state.dataset_profiler.get_catalog(uploaded_shape_dataset["id"])
+    assert catalog is not None
+
+    parser: IntentParser = app.state.intent_parser
+    prompt = parser._build_prompt(
+        question="measure axis por group axis",
+        history=[
+            SimpleNamespace(role="user", text="turno 1"),
+            SimpleNamespace(role="agent", text="turno 2"),
+            SimpleNamespace(role="user", text="turno 3"),
+            SimpleNamespace(role="agent", text="turno 4"),
+            SimpleNamespace(role="user", text="turno 5"),
+        ],
+        catalog=catalog,
+    )
+
+    assert "turno 1" not in prompt
+    assert "turno 2" not in prompt
+    assert "turno 3" in prompt
+    assert "turno 4" in prompt
+    assert "turno 5" in prompt
+    assert "referencias:" in prompt
+
+
+def test_intent_parser_reuses_gemini_cached_content(client: TestClient, app, uploaded_shape_dataset: dict) -> None:
+    dataset_id = uploaded_shape_dataset["id"]
+    queue_fake_gemini(
+        app,
+        structured=[
+            AgentDecision(kind="assistant_message", message="Ayuda 1", reason="r1"),
+            AgentDecision(kind="assistant_message", message="Ayuda 2", reason="r2"),
+        ],
+    )
+
+    first = client.post(
+        "/query",
+        json={"dataset_id": dataset_id, "question": "ventas por sucursal"},
+        headers={"X-User-Id": "usr_cache_ctx"},
+    )
+    second = client.post(
+        "/query",
+        json={"dataset_id": dataset_id, "question": "ventas por fecha"},
+        headers={"X-User-Id": "usr_cache_ctx"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert len(app.state._fake_gemini.cache_create_calls) == 1
+    assert app.state._fake_gemini.structured_calls[-2]["cached_content_name"] == "cachedContents/fake-1"
+    assert app.state._fake_gemini.structured_calls[-1]["cached_content_name"] == "cachedContents/fake-1"
+
+
+def test_intent_parser_skips_duplicate_model_attempts(client: TestClient, app, uploaded_shape_dataset: dict) -> None:
+    app.state.gemini_client.create_cached_content = lambda **_: (_ for _ in ()).throw(GeminiClientError("cache timeout"))
+    before_calls = len(app.state._fake_gemini.structured_calls)
+    queue_fake_gemini(
+        app,
+        structured=[
+            GeminiClientError("service timeout"),
+            GeminiClientError("service timeout"),
+        ],
+    )
+
+    response = client.post(
+        "/query",
+        json={"dataset_id": uploaded_shape_dataset["id"], "question": "consulta con timeout"},
+        headers={"X-User-Id": "usr_single_model_attempt"},
+    )
+
+    assert response.status_code == 502
+    attempts = app.state._fake_gemini.structured_calls[before_calls:]
+    assert len(attempts) == 2
+    assert [call["model"] for call in attempts] == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+
+def test_intent_parser_retries_with_flash_lite_after_flash_timeout(
+    client: TestClient,
+    app,
+    uploaded_shape_dataset: dict,
+) -> None:
+    app.state.gemini_client.create_cached_content = lambda **_: (_ for _ in ()).throw(GeminiClientError("cache timeout"))
+    queue_fake_gemini(
+        app,
+        structured=[
+            GeminiClientError("service timeout"),
+            AgentDecision(kind="assistant_message", message="Fallback lite ok", reason="r-lite"),
+        ],
+    )
+
+    response = client.post(
+        "/query",
+        json={"dataset_id": uploaded_shape_dataset["id"], "question": "que puedes analizar"},
+        headers={"X-User-Id": "usr_flash_lite_retry"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "assistant_message"
+    assert body["message"] == "Fallback lite ok"
+    assert [call["model"] for call in app.state._fake_gemini.structured_calls[-2:]] == [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
+
+
+def test_intent_parser_uses_local_fallback_when_all_models_timeout(tmp_path) -> None:
+    settings = build_settings(tmp_path)
+    settings.allow_local_gemini_fallback = True
+    app = create_app(settings)
+    install_fake_gemini(app)
+    app.state.fx_resolver = FixedFXResolver()
+    app.state.audit_logger.fx_resolver = app.state.fx_resolver
+
+    with TestClient(app) as client:
+        upload = client.post(
+            "/datasets/upload",
+            files={"file": ("shape.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n2026-01-02,beta,150\n", "text/csv")},
+        )
+        dataset_id = upload.json()["id"]
+        app.state.gemini_client.create_cached_content = lambda **_: (_ for _ in ()).throw(GeminiClientError("cache timeout"))
+        queue_fake_gemini(
+            app,
+            structured=[
+                GeminiClientError("service timeout"),
+                GeminiClientError("service timeout"),
+            ],
+        )
+
+        response = client.post(
+            "/query",
+            json={"dataset_id": dataset_id, "question": "measure axis por group axis"},
+            headers={"X-User-Id": "usr_local_fallback"},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["meta"]["plan"]["intent"] == "aggregate_report"
+        assert body["telemetry"]["llm_totals"]["call_count"] == 1
+        assert body["table"]["columns"] == ["Group Axis", "Total de Measure Axis"]
+
+
+def test_intent_parser_applies_cache_failure_cooldown(client: TestClient, app, uploaded_shape_dataset: dict) -> None:
+    cache_attempts = {"count": 0}
+
+    def failing_cache(**_: object) -> str:
+        cache_attempts["count"] += 1
+        raise GeminiClientError("cache timeout")
+
+    app.state.gemini_client.create_cached_content = failing_cache
+    queue_fake_gemini(
+        app,
+        structured=[
+            AgentDecision(kind="assistant_message", message="Ayuda 1", reason="r1"),
+            AgentDecision(kind="assistant_message", message="Ayuda 2", reason="r2"),
+        ],
+    )
+
+    first = client.post(
+        "/query",
+        json={"dataset_id": uploaded_shape_dataset["id"], "question": "pregunta uno"},
+        headers={"X-User-Id": "usr_cache_cooldown"},
+    )
+    second = client.post(
+        "/query",
+        json={"dataset_id": uploaded_shape_dataset["id"], "question": "pregunta dos"},
+        headers={"X-User-Id": "usr_cache_cooldown"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert cache_attempts["count"] == 1
 
 
 def test_query_aggregate_and_cache(client: TestClient, app, uploaded_shape_dataset: dict) -> None:
@@ -329,9 +522,11 @@ def test_query_aggregate_and_cache(client: TestClient, app, uploaded_shape_datas
     assert body["telemetry"]["llm_totals"]["output_token_count"] == 46
     assert body["telemetry"]["llm_totals"]["thinking_token_count"] == 0
     assert body["telemetry"]["llm_totals"]["total_token_count"] == 256
-    assert body["telemetry"]["llm_totals"]["total_cost_usd"] == 0.0000394
-    assert body["telemetry"]["llm_totals"]["total_cost_mxn"] == 0.0006698
+    assert body["telemetry"]["llm_totals"]["total_cost_usd"] == 0.0001222
+    assert body["telemetry"]["llm_totals"]["total_cost_mxn"] == 0.0020774
     assert len(body["telemetry"]["llm_calls"]) == 2
+    assert body["telemetry"]["llm_calls"][0]["model"] == "gemini-2.5-flash"
+    assert body["telemetry"]["llm_calls"][1]["model"] == "gemini-2.5-flash-lite"
 
     second = client.post("/query", json=payload, headers=headers)
     assert second.status_code == 200, second.text
@@ -775,7 +970,7 @@ def test_metrics_endpoints_return_raw_and_summary(client: TestClient, app, uploa
     assert raw_payload["items"][0]["query_id"]
     assert raw_payload["items"][0]["llm_totals"]["call_count"] == 2
     assert raw_payload["items"][0]["llm_totals"]["input_token_count"] == 210
-    assert raw_payload["items"][0]["llm_totals"]["total_cost_mxn"] == 0.0006698
+    assert raw_payload["items"][0]["llm_totals"]["total_cost_mxn"] == 0.0020774
     assert len(raw_payload["items"][0]["llm_calls"]) == 2
 
     summary = client.get("/metrics/summary", params={"dataset_id": uploaded_shape_dataset["id"]})
@@ -784,8 +979,9 @@ def test_metrics_endpoints_return_raw_and_summary(client: TestClient, app, uploa
     assert summary_payload["query_count"] >= 1
     assert summary_payload["total_input_token_count"] >= 210
     assert summary_payload["total_token_count"] >= 256
-    assert summary_payload["total_cost_mxn"] >= 0.0006698
+    assert summary_payload["total_cost_mxn"] >= 0.0020774
     assert any(item["model"].startswith("gemini-2.5-flash") for item in summary_payload["by_model"])
+    assert any(item["model"].startswith("gemini-2.5-flash-lite") for item in summary_payload["by_model"])
     assert any(item["stage"] == "intent" for item in summary_payload["by_stage"])
 
     timeseries = client.get("/metrics/timeseries", params={"dataset_id": uploaded_shape_dataset["id"]})
@@ -793,7 +989,7 @@ def test_metrics_endpoints_return_raw_and_summary(client: TestClient, app, uploa
     timeseries_payload = timeseries.json()
     assert len(timeseries_payload["items"]) == 1
     assert timeseries_payload["items"][0]["input_token_count"] == 210
-    assert timeseries_payload["items"][0]["total_cost_mxn"] == 0.0006698
+    assert timeseries_payload["items"][0]["total_cost_mxn"] == 0.0020774
 
 
 def test_audit_logger_migrates_legacy_schema(tmp_path) -> None:

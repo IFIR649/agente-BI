@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from copy import deepcopy
 from datetime import date, datetime
 
@@ -13,7 +14,7 @@ from backend.app.core.gemini_client import (
     GeminiUnavailableError,
 )
 from backend.app.core.telemetry import QueryTelemetryCollector
-from backend.app.core.utils import humanize_identifier, normalize_weekday_name
+from backend.app.core.utils import humanize_identifier, normalize_text, normalize_weekday_name
 from backend.app.models.dataset import DatasetCatalog
 from backend.app.models.intent import AgentDecision, ConversationTurn, QueryFilter, QueryPlan, SortSpec, StructuredAgentDecision
 from backend.app.models.telemetry import LLMCallTelemetry
@@ -37,16 +38,21 @@ class IntentParser:
         telemetry_collector: QueryTelemetryCollector | None = None,
     ) -> AgentDecision:
         if not self.gemini_client.configured:
+            if self.settings.allow_local_gemini_fallback:
+                logger.warning("status=local_fallback reason=gemini_unavailable")
+                return self._parse_locally(question=question, catalog=catalog, reason="gemini_unavailable")
             raise GeminiUnavailableError("Gemini no esta configurado. Define AGENT_GEMINI_API_KEY.")
 
-        prompt = self._build_prompt(question=question, history=history or [])
+        system_instruction = self._build_system_instruction(catalog)
+        prompt = self._build_prompt(question=question, history=history or [], catalog=catalog)
         last_service_error: GeminiClientError | None = None
         format_failures = 0
 
-        for model_name in (self.settings.gemini_flash_model, self.settings.gemini_pro_model):
+        for model_name in self._candidate_models():
             try:
-                result = self.gemini_client.generate_structured_result(
-                    system_instruction=self._build_system_instruction(catalog),
+                result = self._generate_structured_with_cache(
+                    catalog=catalog,
+                    system_instruction=system_instruction,
                     prompt=prompt,
                     response_model=StructuredAgentDecision,
                     model=model_name,
@@ -88,12 +94,242 @@ class IntentParser:
             )
 
         if last_service_error is not None:
+            if self.settings.allow_local_gemini_fallback:
+                logger.warning("status=local_fallback reason=%s", last_service_error)
+                return self._parse_locally(question=question, catalog=catalog, reason=str(last_service_error))
             raise last_service_error
 
         return self._generic_assistant_message(
             catalog=catalog,
             reason="No pude interpretar la consulta con el catalogo disponible.",
         )
+
+    def _candidate_models(self) -> list[str]:
+        candidates: list[str] = []
+        for model_name in (
+            self.settings.gemini_flash_model,
+            self.settings.gemini_pro_model,
+            self.settings.gemini_lite_model,
+        ):
+            if model_name and model_name not in candidates:
+                candidates.append(model_name)
+        return candidates
+
+    def _parse_locally(self, *, question: str, catalog: DatasetCatalog, reason: str) -> AgentDecision:
+        normalized = self._searchable_text(question)
+        if not normalized.strip():
+            return self._generic_clarification(
+                catalog=catalog,
+                reason="Necesito una pregunta mas concreta para construir la consulta.",
+            )
+
+        if self._is_meta_question(normalized):
+            return self._generic_assistant_message(
+                catalog=catalog,
+                reason=f"Use un fallback local porque Gemini no estuvo disponible ({reason}).",
+            )
+
+        metrics = self._match_alias_targets(text=normalized, catalog=catalog, scope="metric")
+        dimensions = self._match_alias_targets(text=normalized, catalog=catalog, scope="dimension")
+        time_dimension = self._infer_time_dimension(normalized, catalog)
+        if time_dimension and time_dimension not in dimensions:
+            dimensions.insert(0, time_dimension)
+
+        if not metrics:
+            fallback_metric = catalog.default_metric or (catalog.suggested_metrics[0] if catalog.suggested_metrics else None)
+            if fallback_metric and fallback_metric in catalog.metrics_index:
+                metrics = [fallback_metric]
+
+        if not metrics and "row_count" in catalog.metrics_index:
+            metrics = ["row_count"]
+
+        if not metrics:
+            return self._generic_clarification(
+                catalog=catalog,
+                reason="No pude identificar una metrica valida con el fallback local.",
+            )
+
+        top_n = self._extract_top_n(normalized)
+        if top_n and not dimensions:
+            return AgentDecision(
+                kind="clarification",
+                question="¿Sobre que dimension quieres ver el top?",
+                reason="Detecte una peticion de ranking, pero falta la dimension para agrupar.",
+                hints=self._dimension_hints(catalog),
+                meta={"kind": "dimension", "source": "local_fallback"},
+            )
+
+        if self._looks_grouped_query(normalized) and not dimensions:
+            return AgentDecision(
+                kind="clarification",
+                question="¿Como quieres agrupar el resultado?",
+                reason="La consulta parece pedir un desglose, pero no detecte una dimension valida.",
+                hints=self._dimension_hints(catalog),
+                meta={"kind": "dimension", "source": "local_fallback"},
+            )
+
+        intent = "aggregate_report"
+        if any(
+            definition.kind == "time_granularity"
+            for name, definition in catalog.dimension_definitions.items()
+            if name in dimensions
+        ):
+            intent = "time_series_report"
+        elif self._looks_time_series_query(normalized):
+            intent = "time_series_report"
+
+        sort_field = dimensions[0] if intent == "time_series_report" and dimensions else metrics[0]
+        sort_order = "asc" if intent == "time_series_report" and dimensions else "desc"
+        visualization = "line" if intent == "time_series_report" else ("bar" if dimensions else "table")
+
+        decision = AgentDecision(
+            kind="query",
+            plan=QueryPlan(
+                intent=intent,
+                dimensions=dimensions,
+                metrics=metrics[:3],
+                sort=SortSpec(field=sort_field, order=sort_order),
+                visualization=visualization,
+                top_n=top_n,
+                confidence=0.72,
+            ),
+            meta={"kind": "local_fallback", "reason": reason},
+        )
+        logger.warning(
+            "status=local_fallback kind=query metrics=%s dimensions=%s top_n=%s reason=%s",
+            metrics,
+            dimensions,
+            top_n,
+            reason,
+        )
+        return self._finalize_decision(question=question, catalog=catalog, decision=decision)
+
+    def _searchable_text(self, text: str) -> str:
+        normalized = normalize_text(text)
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return f" {normalized} " if normalized else ""
+
+    def _match_alias_targets(
+        self,
+        *,
+        text: str,
+        catalog: DatasetCatalog,
+        scope: str,
+    ) -> list[str]:
+        searchable_text = text if text.startswith(" ") else self._searchable_text(text)
+        if not searchable_text:
+            return []
+
+        if scope == "metric":
+            allowed_targets = set(catalog.metrics_index)
+        else:
+            allowed_targets = set(catalog.dimension_definitions)
+
+        seen: set[str] = set()
+        targets: list[str] = []
+        for alias, target in sorted(catalog.aliases.items(), key=lambda item: len(item[0]), reverse=True):
+            alias_text = self._searchable_text(alias)
+            if not alias_text or target not in allowed_targets:
+                continue
+            if alias_text in searchable_text and target not in seen:
+                seen.add(target)
+                targets.append(target)
+            if len(targets) >= 6:
+                break
+        return targets
+
+    def _is_meta_question(self, normalized_question: str) -> bool:
+        meta_phrases = (
+            " que puedes analizar ",
+            " que puedo analizar ",
+            " que tipo de analisis ",
+            " que consultas ",
+            " que puedes hacer ",
+            " ayudame ",
+            " ayuda ",
+            " opciones ",
+            " capacidades ",
+            " como funciona ",
+        )
+        return any(phrase in f" {normalized_question} " for phrase in meta_phrases)
+
+    def _looks_grouped_query(self, normalized_question: str) -> bool:
+        grouping_phrases = (
+            " por ",
+            " segun ",
+            " segun ",
+            " agrup",
+            " desglos",
+            " compar",
+            " top ",
+            " ranking ",
+        )
+        return any(phrase in f" {normalized_question} " for phrase in grouping_phrases)
+
+    def _looks_time_series_query(self, normalized_question: str) -> bool:
+        time_phrases = (
+            " tendencia ",
+            " evolucion ",
+            " historico ",
+            " historica ",
+            " historicas ",
+            " historicos ",
+            " mensual ",
+            " semanal ",
+            " diario ",
+            " diaria ",
+            " por mes ",
+            " por semana ",
+            " por dia ",
+            " por ano ",
+            " por dia de la semana ",
+        )
+        return any(phrase in f" {normalized_question} " for phrase in time_phrases)
+
+    def _infer_time_dimension(self, normalized_question: str, catalog: DatasetCatalog) -> str | None:
+        if not catalog.default_date_column:
+            return None
+
+        phrase_to_granularity = (
+            ("day_of_week", (" dia de la semana ", " dias de la semana ", " dia semana ")),
+            ("month", (" mensual ", " por mes ", " mes ", " meses ")),
+            ("week", (" semanal ", " por semana ", " semana ", " semanas ")),
+            ("day", (" diario ", " diaria ", " por dia ", " dia ", " dias ")),
+            ("year", (" anual ", " por ano ", " ano ", " anos ")),
+        )
+        question = f" {normalized_question} "
+        for granularity, phrases in phrase_to_granularity:
+            if any(phrase in question for phrase in phrases):
+                dimension_name = f"{catalog.default_date_column}_{granularity}"
+                if dimension_name in catalog.dimension_definitions:
+                    return dimension_name
+        return None
+
+    def _extract_top_n(self, normalized_question: str) -> int | None:
+        match = re.search(r"\btop\s+(\d{1,3})\b", normalized_question)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _generate_structured_with_cache(
+        self,
+        *,
+        catalog: DatasetCatalog,
+        system_instruction: str,
+        prompt: str,
+        response_model: type[StructuredAgentDecision],
+        model: str,
+        temperature: float,
+    ):
+        return self.gemini_client.generate_structured_result(
+            system_instruction=system_instruction,
+            prompt=prompt,
+            response_model=response_model,
+            model=model,
+            temperature=temperature,
+        )
+
 
     def _build_system_instruction(self, catalog: DatasetCatalog) -> str:
         catalog_info = {
@@ -104,17 +340,7 @@ class IntentParser:
             "suggested_metrics": catalog.suggested_metrics,
             "suggested_dimensions": catalog.suggested_dimensions,
             "columns": [
-                {
-                    "name": name,
-                    "type": column.type,
-                    "label": column.label,
-                    "semantic_role": column.semantic_role,
-                    "non_null_ratio": round(column.non_null_ratio, 3),
-                    "uniqueness_ratio": round(column.uniqueness_ratio, 3),
-                    "boolean_like": column.boolean_like,
-                    "min": column.min_value,
-                    "max": column.max_value,
-                }
+                self._compact_column_descriptor(name=name, catalog=catalog)
                 for name, column in catalog.columns.items()
             ],
             "dimensions_allowed": [
@@ -136,8 +362,7 @@ class IntentParser:
                 }
                 for metric in catalog.metrics_allowed
             ],
-            "aliases": catalog.aliases,
-            "sample_rows": catalog.sample_rows[:3],
+            "sample_rows": catalog.sample_rows[:1],
         }
 
         return (
@@ -165,12 +390,49 @@ class IntentParser:
             f"CATALOGO:\n{json.dumps(catalog_info, ensure_ascii=True, indent=2)}"
         )
 
-    def _build_prompt(self, *, question: str, history: list[ConversationTurn]) -> str:
+    def _compact_column_descriptor(self, *, name: str, catalog: DatasetCatalog) -> dict[str, object]:
+        column = catalog.columns[name]
+        descriptor: dict[str, object] = {
+            "name": name,
+            "type": column.type,
+            "label": column.label,
+            "semantic_role": column.semantic_role,
+        }
+        if column.semantic_role in {"time", "measure"}:
+            descriptor["min"] = column.min_value
+            descriptor["max"] = column.max_value
+        return descriptor
+
+    def _build_prompt(self, *, question: str, history: list[ConversationTurn], catalog: DatasetCatalog) -> str:
         if not history:
-            return question
-        recent = history[-6:]
-        lines = [f"{turn.role}: {turn.text}" for turn in recent if turn.role in {"user", "agent"}]
-        return "\n".join(["Historial reciente:", *lines, f"Pregunta actual: {question}"])
+            alias_targets = self._alias_targets(question, catalog)
+            if not alias_targets:
+                return question
+            return "\n".join([question, f"Referencias detectadas: {', '.join(alias_targets)}"])
+
+        recent = history[-3:]
+        lines = ["Historial reciente:"]
+        for turn in recent:
+            if turn.role not in {"user", "agent"}:
+                continue
+            line = f"{turn.role}: {turn.text}"
+            alias_targets = self._alias_targets(turn.text, catalog)
+            if alias_targets:
+                line += f" | referencias: {', '.join(alias_targets)}"
+            lines.append(line)
+
+        current_line = f"Pregunta actual: {question}"
+        current_alias_targets = self._alias_targets(question, catalog)
+        if current_alias_targets:
+            current_line += f" | referencias: {', '.join(current_alias_targets)}"
+        lines.append(current_line)
+        return "\n".join(lines)
+
+    def _alias_targets(self, text: str, catalog: DatasetCatalog) -> list[str]:
+        searchable_text = self._searchable_text(text)
+        metric_targets = self._match_alias_targets(text=searchable_text, catalog=catalog, scope="metric")
+        dimension_targets = self._match_alias_targets(text=searchable_text, catalog=catalog, scope="dimension")
+        return metric_targets + [target for target in dimension_targets if target not in metric_targets]
 
     def _finalize_decision(self, *, question: str, catalog: DatasetCatalog, decision: AgentDecision) -> AgentDecision:
         if decision.kind == "assistant_message":

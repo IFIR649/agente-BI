@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
+from backend.app.core.auth import get_auth_context
 from backend.app.models.dataset import DatasetSummary, UploadMetadata
 
 
@@ -25,8 +26,8 @@ async def list_datasets(request: Request) -> list[DatasetSummary]:
 
 
 @router.get("/active", response_model=DatasetSummary)
-async def get_active_dataset(request: Request, x_user_id: str | None = Header(default=None)) -> DatasetSummary:
-    user_id = _resolve_user_id(request, x_user_id)
+async def get_active_dataset(request: Request) -> DatasetSummary:
+    user_id = get_auth_context(request).actor_user_id
     dataset_id = request.app.state.active_dataset_store.get_active_dataset_id(user_id)
     if not dataset_id:
         raise HTTPException(status_code=404, detail="No hay dataset activo para este usuario.")
@@ -43,9 +44,8 @@ async def get_active_dataset(request: Request, x_user_id: str | None = Header(de
 async def set_active_dataset(
     request: Request,
     body: ActiveDatasetUpdate,
-    x_user_id: str | None = Header(default=None),
 ) -> DatasetSummary:
-    user_id = _resolve_user_id(request, x_user_id)
+    user_id = get_auth_context(request).actor_user_id
     catalog = request.app.state.dataset_profiler.get_catalog(body.dataset_id)
     if catalog is None:
         raise HTTPException(status_code=404, detail="Dataset no encontrado.")
@@ -59,7 +59,6 @@ async def upload_dataset(
     request: Request,
     file: UploadFile = File(...),
     metadata: str | None = Form(default=None),
-    x_user_id: str | None = Header(default=None),
 ) -> DatasetSummary:
     settings = request.app.state.settings
     filename = file.filename or "dataset.csv"
@@ -92,7 +91,7 @@ async def upload_dataset(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"No se pudo procesar el CSV: {exc}") from exc
 
-    user_id = _resolve_user_id(request, x_user_id)
+    user_id = get_auth_context(request).actor_user_id
     request.app.state.active_dataset_store.set_active_dataset(user_id, catalog.id)
     return catalog.to_summary()
 
@@ -111,11 +110,3 @@ async def update_labels(request: Request, dataset_id: str, body: LabelUpdate) ->
         raise HTTPException(status_code=404, detail="Dataset no encontrado.")
 
     return catalog.to_summary()
-
-
-def _resolve_user_id(request: Request, x_user_id: str | None) -> str:
-    if x_user_id:
-        return x_user_id
-    if request.client and request.client.host:
-        return f"anonymous:{request.client.host}"
-    return "anonymous:unknown"

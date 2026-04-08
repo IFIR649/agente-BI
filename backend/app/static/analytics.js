@@ -13,6 +13,11 @@ const state = {
   total: 0,
 };
 
+const STORAGE_KEYS = {
+  apiKey: "csv-agent-api-key",
+  userId: "csv-agent-user-id",
+};
+
 const palette = {
   input: "#166a63",
   output: "#d97a36",
@@ -21,6 +26,10 @@ const palette = {
 };
 
 const elements = {
+  apiKeyInput: document.getElementById("api-key-input"),
+  actorUserIdInput: document.getElementById("actor-user-id-input"),
+  authSave: document.getElementById("auth-save"),
+  authStatusText: document.getElementById("auth-status-text"),
   datasetChip: document.getElementById("analytics-dataset-chip"),
   refresh: document.getElementById("analytics-refresh"),
   filterForm: document.getElementById("analytics-filter-form"),
@@ -54,26 +63,47 @@ async function bootstrap() {
   renderSummaryLoading();
   renderChartLoading();
   renderTableLoading();
+  syncAuthInputs();
+  if (!hasApiAccess()) {
+    setStatus("Captura la API key y el user id para consultar analytics.", "warn");
+    setAuthStatus("Falta configurar el acceso.", "warn");
+    updateDatasetChip();
+    updatePaginationState(false);
+    return;
+  }
+  setAuthStatus("Acceso listo.", "success");
   await loadDatasets();
   syncControlsFromState();
   await loadAnalyticsData();
 }
 
 function bindEvents() {
+  elements.authSave?.addEventListener("click", () => {
+    saveAuthInputs();
+    bootstrap();
+  });
   elements.refresh.addEventListener("click", () => loadAnalyticsData());
   elements.filterForm.addEventListener("submit", (event) => {
     event.preventDefault();
     applyFilters({ resetOffset: true });
   });
 
-  for (const control of [elements.dataset, elements.status, elements.cacheHit, elements.from, elements.to]) {
+  for (const control of [
+    elements.dataset,
+    elements.status,
+    elements.cacheHit,
+    elements.from,
+    elements.to,
+  ]) {
     control.addEventListener("change", () => applyFilters({ resetOffset: true }));
   }
 
-  elements.userId.addEventListener("input", () => {
+  for (const control of [elements.userId]) {
+    control.addEventListener("input", () => {
     clearTimeout(userIdDebounce);
     userIdDebounce = window.setTimeout(() => applyFilters({ resetOffset: true }), 300);
-  });
+    });
+  }
 
   elements.pagePrev.addEventListener("click", () => {
     if (state.offset <= 0) return;
@@ -89,7 +119,10 @@ function bindEvents() {
 }
 
 async function loadDatasets() {
-  const response = await fetch("/datasets");
+  ensureApiAccess();
+  const response = await fetch("/datasets", {
+    headers: buildApiHeaders(),
+  });
   const payload = await parseJsonResponse(response);
   if (!response.ok) throw new Error(payload.detail || "No se pudieron cargar los datasets.");
 
@@ -114,6 +147,7 @@ function renderDatasetOptions() {
 }
 
 async function loadAnalyticsData() {
+  ensureApiAccess();
   syncStateFromControls();
   syncUrlFromState();
   updateDatasetChip();
@@ -126,9 +160,9 @@ async function loadAnalyticsData() {
     const timeseriesQuery = buildApiQuery({ includePagination: false });
 
     const [summaryResponse, queriesResponse, timeseriesResponse] = await Promise.all([
-      fetch(`/metrics/summary?${summaryQuery.toString()}`),
-      fetch(`/metrics/queries?${queriesQuery.toString()}`),
-      fetch(`/metrics/timeseries?${timeseriesQuery.toString()}`),
+      fetch(`/metrics/summary?${summaryQuery.toString()}`, { headers: buildApiHeaders() }),
+      fetch(`/metrics/queries?${queriesQuery.toString()}`, { headers: buildApiHeaders() }),
+      fetch(`/metrics/timeseries?${timeseriesQuery.toString()}`, { headers: buildApiHeaders() }),
     ]);
     const [summaryPayload, queriesPayload, timeseriesPayload] = await Promise.all([
       parseJsonResponse(summaryResponse),
@@ -624,6 +658,64 @@ function setStatus(text, tone) {
   elements.statusText.className = tone ? `status-text ${tone}` : "status-text";
 }
 
+function syncAuthInputs() {
+  if (elements.apiKeyInput) {
+    elements.apiKeyInput.value = ensureApiKey();
+  }
+  if (elements.actorUserIdInput) {
+    elements.actorUserIdInput.value = ensureUserId();
+  }
+}
+
+function saveAuthInputs() {
+  const apiKey = (elements.apiKeyInput?.value || "").trim();
+  const userId = (elements.actorUserIdInput?.value || "").trim() || `web-${generateId()}`;
+  window.localStorage.setItem(STORAGE_KEYS.apiKey, apiKey);
+  window.localStorage.setItem(STORAGE_KEYS.userId, userId);
+  if (elements.actorUserIdInput) {
+    elements.actorUserIdInput.value = userId;
+  }
+  setAuthStatus(apiKey ? "Acceso guardado." : "Captura la API key para continuar.", apiKey ? "success" : "warn");
+}
+
+function ensureApiKey() {
+  return (window.localStorage.getItem(STORAGE_KEYS.apiKey) || "").trim();
+}
+
+function ensureUserId() {
+  let userId = window.localStorage.getItem(STORAGE_KEYS.userId);
+  if (!userId) {
+    userId = `web-${generateId()}`;
+    window.localStorage.setItem(STORAGE_KEYS.userId, userId);
+  }
+  return userId;
+}
+
+function hasApiAccess() {
+  return Boolean(ensureApiKey() && ensureUserId());
+}
+
+function ensureApiAccess() {
+  if (!hasApiAccess()) {
+    throw new Error("Captura la API key y el user id para usar esta pantalla.");
+  }
+}
+
+function buildApiHeaders(extraHeaders = {}) {
+  ensureApiAccess();
+  return {
+    "X-API-Key": ensureApiKey(),
+    "X-User-Id": ensureUserId(),
+    ...extraHeaders,
+  };
+}
+
+function setAuthStatus(text, tone = "") {
+  if (!elements.authStatusText) return;
+  elements.authStatusText.textContent = text;
+  elements.authStatusText.className = tone ? `status-text ${tone}` : "status-text";
+}
+
 async function parseJsonResponse(response) {
   const text = await response.text();
   if (!text) return {};
@@ -743,4 +835,31 @@ function escapeAttr(value) {
     .replaceAll("&", "&amp;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function generateId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch (_) {}
+
+  try {
+    if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+      return [
+        hex.slice(0, 4).join(""),
+        hex.slice(4, 6).join(""),
+        hex.slice(6, 8).join(""),
+        hex.slice(8, 10).join(""),
+        hex.slice(10, 16).join(""),
+      ].join("-");
+    }
+  } catch (_) {}
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }

@@ -419,6 +419,7 @@ class IntentParser:
             temperature=self.settings.gemini_temperature_intent,
             cached_content_name=cache_name,  # None si fallo la creacion
         )
+
 ```
 
 > **Nota:** El Context Caching de Gemini tiene un minimo de 1,024 tokens para activarse. Con cualquier dataset de mas de ~12 columnas ya supera ese umbral.

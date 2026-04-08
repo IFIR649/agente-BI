@@ -89,6 +89,24 @@ button { cursor: pointer; }
   gap: 16px;
 }
 
+.auth-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.prod-chat-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
 .prod-choice-list {
   display: flex;
   flex-direction: column;
@@ -109,6 +127,14 @@ button { cursor: pointer; }
   flex-direction: column;
   gap: 14px;
   min-height: 420px;
+}
+
+#loading-stage[aria-hidden="true"],
+#session-stage[aria-hidden="true"],
+#selector-stage[aria-hidden="true"],
+#upload-stage[aria-hidden="true"],
+#chat-stage[aria-hidden="true"] {
+  display: none !important;
 }
 
 /* ─── Typography ────────────────────────────────────────────────────────── */
@@ -316,7 +342,64 @@ h3 { font-size: 1rem; }
 
 .message-body {
   line-height: 1.5;
+}
+
+.message-body.plain-text {
   white-space: pre-wrap;
+}
+
+.message-body.rich-text {
+  white-space: normal;
+}
+
+.message-body.rich-text > :first-child {
+  margin-top: 0;
+}
+
+.message-body.rich-text > :last-child {
+  margin-bottom: 0;
+}
+
+.message-body.rich-text p,
+.message-body.rich-text ul,
+.message-body.rich-text ol,
+.message-body.rich-text blockquote,
+.message-body.rich-text h4,
+.message-body.rich-text h5,
+.message-body.rich-text h6 {
+  margin: 0 0 12px;
+}
+
+.message-body.rich-text ul,
+.message-body.rich-text ol {
+  padding-left: 22px;
+}
+
+.message-body.rich-text li + li {
+  margin-top: 6px;
+}
+
+.message-body.rich-text blockquote {
+  padding-left: 12px;
+  border-left: 3px solid rgba(22, 106, 99, 0.24);
+  color: var(--muted);
+}
+
+.message-body.rich-text code {
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: rgba(31, 42, 44, 0.08);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.9em;
+}
+
+.message-body.rich-text a {
+  color: var(--primary-strong);
+  font-weight: 700;
+}
+
+.message-body.rich-text strong {
+  font-weight: 800;
 }
 
 .hint-actions {
@@ -814,6 +897,10 @@ th {
   }
 
   .analytics-breakdown-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .auth-grid {
     grid-template-columns: 1fr;
   }
 

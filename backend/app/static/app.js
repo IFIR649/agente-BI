@@ -9,10 +9,15 @@ const state = {
 const palette = ["#166a63", "#d97a36", "#355c7d", "#8b5a2b", "#7a3b69", "#2d7a4f", "#a84a35"];
 const STORAGE_KEYS = {
   chatHistory: "chat-history",
+  apiKey: "csv-agent-api-key",
   userId: "csv-agent-user-id",
 };
 
 const elements = {
+  apiKeyInput: document.getElementById("api-key-input"),
+  actorUserIdInput: document.getElementById("actor-user-id-input"),
+  authSave: document.getElementById("auth-save"),
+  authStatusText: document.getElementById("auth-status-text"),
   uploadForm: document.getElementById("upload-form"),
   uploadFile: document.getElementById("upload-file"),
   uploadDisplayName: document.getElementById("upload-display-name"),
@@ -40,7 +45,7 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 async function bootstrap() {
-  ensureUserId();
+  syncAuthInputs();
   loadSessionHistory();
   if (!state.messages.length) {
     pushMessage({
@@ -48,12 +53,31 @@ async function bootstrap() {
       text: "Carga un CSV o selecciona un dataset para empezar. El agente se adapta a la estructura del archivo y te puede orientar con sugerencias basadas en ese dataset.",
     });
   }
+  updateComposerState();
+
+  if (!hasApiAccess()) {
+    state.datasets = [];
+    state.selectedDatasetId = null;
+    renderDatasets();
+    renderSelectedDataset();
+    setUploadStatus("Captura la API key y el user id para consultar datasets.", "warn", "Acceso");
+    setAuthStatus("Falta configurar el acceso.", "warn");
+    updateComposerState("Captura la API key y el user id para habilitar esta pantalla.");
+    updateAnalyticsLink();
+    return;
+  }
+
+  setAuthStatus("Acceso listo.", "success");
   await loadDatasets();
   await hydrateActiveDataset();
   updateComposerState();
 }
 
 function bindEvents() {
+  elements.authSave?.addEventListener("click", () => {
+    saveAuthInputs();
+    bootstrap();
+  });
   elements.uploadForm.addEventListener("submit", handleUploadSubmit);
   elements.refreshDatasets.addEventListener("click", loadDatasets);
   elements.queryForm.addEventListener("submit", handleQuerySubmit);
@@ -113,7 +137,10 @@ function loadSessionHistory() {
 async function loadDatasets() {
   setUploadStatus("Cargando datasets...", "warn", "Catalogo");
   try {
-    const response = await fetch("/datasets");
+    ensureApiAccess();
+    const response = await fetch("/datasets", {
+      headers: buildApiHeaders(),
+    });
     if (!response.ok) throw new Error("No se pudieron cargar los datasets.");
     const datasets = await response.json();
     state.datasets = datasets;
@@ -138,8 +165,9 @@ async function loadDatasets() {
 
 async function hydrateActiveDataset() {
   try {
+    ensureApiAccess();
     const response = await fetch("/datasets/active", {
-      headers: { "X-User-Id": ensureUserId() },
+      headers: buildApiHeaders(),
     });
     const payload = await parseJsonResponse(response);
     if (response.status === 404) {
@@ -160,12 +188,10 @@ async function hydrateActiveDataset() {
 }
 
 async function setActiveDataset(datasetId) {
+  ensureApiAccess();
   const response = await fetch("/datasets/active", {
     method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "X-User-Id": ensureUserId(),
-    },
+    headers: buildApiHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ dataset_id: datasetId }),
   });
   const payload = await parseJsonResponse(response);
@@ -196,6 +222,7 @@ async function handleUploadSubmit(event) {
   setUploadStatus("Subiendo y perfilando dataset...", "warn", "Subiendo");
 
   try {
+    ensureApiAccess();
     const formData = new FormData();
     formData.append("file", file);
     const displayName = elements.uploadDisplayName.value.trim();
@@ -203,7 +230,7 @@ async function handleUploadSubmit(event) {
 
     const response = await fetch("/datasets/upload", {
       method: "POST",
-      headers: { "X-User-Id": ensureUserId() },
+      headers: buildApiHeaders(),
       body: formData,
     });
     const payload = await parseJsonResponse(response);
@@ -239,6 +266,7 @@ async function handleQuerySubmit(event) {
   let thinkingId = null;
 
   try {
+    ensureApiAccess();
     updateComposerState("Interpretando tu pregunta...");
     pushMessage({ role: "user", text: question });
     thinkingId = pushMessage({ role: "thinking", text: renderThinkingMarkup(), html: true });
@@ -246,7 +274,7 @@ async function handleQuerySubmit(event) {
 
     const response = await fetch("/query", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-User-Id": ensureUserId() },
+      headers: buildApiHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ dataset_id: selectedDataset.id, question, history }),
     });
 
@@ -853,6 +881,55 @@ function ensureUserId() {
     window.localStorage.setItem(STORAGE_KEYS.userId, userId);
   }
   return userId;
+}
+
+function ensureApiKey() {
+  return (window.localStorage.getItem(STORAGE_KEYS.apiKey) || "").trim();
+}
+
+function hasApiAccess() {
+  return Boolean(ensureApiKey() && ensureUserId());
+}
+
+function ensureApiAccess() {
+  if (!hasApiAccess()) {
+    throw new Error("Captura la API key y el user id para usar esta pantalla.");
+  }
+}
+
+function syncAuthInputs() {
+  if (elements.apiKeyInput) {
+    elements.apiKeyInput.value = ensureApiKey();
+  }
+  if (elements.actorUserIdInput) {
+    elements.actorUserIdInput.value = ensureUserId();
+  }
+}
+
+function saveAuthInputs() {
+  const apiKey = (elements.apiKeyInput?.value || "").trim();
+  const userId = (elements.actorUserIdInput?.value || "").trim() || `web-${generateId()}`;
+  window.localStorage.setItem(STORAGE_KEYS.apiKey, apiKey);
+  window.localStorage.setItem(STORAGE_KEYS.userId, userId);
+  if (elements.actorUserIdInput) {
+    elements.actorUserIdInput.value = userId;
+  }
+  setAuthStatus(apiKey ? "Acceso guardado." : "Captura la API key para continuar.", apiKey ? "success" : "warn");
+}
+
+function buildApiHeaders(extraHeaders = {}) {
+  ensureApiAccess();
+  return {
+    "X-API-Key": ensureApiKey(),
+    "X-User-Id": ensureUserId(),
+    ...extraHeaders,
+  };
+}
+
+function setAuthStatus(text, tone = "") {
+  if (!elements.authStatusText) return;
+  elements.authStatusText.textContent = text;
+  elements.authStatusText.className = tone ? `status-text ${tone}` : "status-text";
 }
 
 function updateAnalyticsLink() {

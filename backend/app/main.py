@@ -1,39 +1,76 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi import Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.config import Settings, get_settings
 from backend.app.core.active_dataset import ActiveDatasetStore
+from backend.app.core.auth import AuthStore, require_api_access
 from backend.app.core.audit import AuditLogger
 from backend.app.core.cache import TTLCache
 from backend.app.core.database import DuckDBManager
 from backend.app.core.fx import BanxicoFxResolver
 from backend.app.core.gemini_client import GeminiClient
 from backend.app.core.rate_limiter import InMemoryRateLimiter
+from backend.app.core.session import SessionStore
+from backend.app.routers.chat import router as chat_router
 from backend.app.routers.datasets import router as datasets_router
 from backend.app.routers.health import router as health_router
 from backend.app.routers.metrics import router as metrics_router
 from backend.app.routers.query import router as query_router
+from backend.app.routers.sessions import router as sessions_router
 from backend.app.services.dataset_profiler import DatasetProfiler
 from backend.app.services.intent_parser import IntentParser
 from backend.app.services.query_executor import QueryExecutor
 from backend.app.services.response_builder import ResponseBuilder
 from backend.app.services.summary_writer import SummaryWriter
 
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+async def _session_cleanup_loop(app: FastAPI) -> None:
+    settings: Settings = app.state.settings
+    while True:
+        await asyncio.sleep(settings.session_cleanup_interval_seconds)
+        try:
+            expired = app.state.session_store.cleanup_expired(settings.session_timeout_seconds)
+            if expired:
+                logger.info("session cleanup: %d sesiones expiradas destruidas", expired)
+        except Exception as exc:
+            logger.warning("session cleanup error: %s", exc)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    cleanup_task = asyncio.create_task(_session_cleanup_loop(app))
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        app.state.session_store.destroy_all()
+        logger.info("server shutdown: todas las sesiones destruidas")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     settings.ensure_directories()
 
-    app = FastAPI(title=settings.app_name)
+    app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 
     app.add_middleware(
         CORSMiddleware,
@@ -57,8 +94,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.fx_resolver = fx_resolver
     app.state.cache = TTLCache(settings.cache_ttl_seconds)
     app.state.rate_limiter = InMemoryRateLimiter(settings.rate_limit_requests, settings.rate_limit_window_seconds)
+    app.state.auth_store = AuthStore(settings.audit_db_path, settings.api_key)
     app.state.audit_logger = AuditLogger(settings.audit_db_path, fx_resolver=fx_resolver)
     app.state.active_dataset_store = ActiveDatasetStore(settings.audit_db_path)
+    app.state.session_store = SessionStore(settings.audit_db_path)
     app.state.dataset_profiler = DatasetProfiler(settings, db_manager, gemini_client)
     app.state.intent_parser = IntentParser(settings, gemini_client)
     app.state.query_executor = QueryExecutor(settings, db_manager)
@@ -91,15 +130,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "health_url": "/health",
             "datasets_url": "/datasets",
             "query_url": "/query",
+            "sessions_url": "/sessions",
+            "chat_bootstrap_url": "/chat/bootstrap",
+            "chat_session_url": "/chat/session",
+            "chat_message_url": "/chat/message",
+            "chat_heartbeat_url": "/chat/heartbeat",
+            "chat_logout_url": "/chat/logout",
             "metrics_queries_url": "/metrics/queries",
             "metrics_summary_url": "/metrics/summary",
             "metrics_timeseries_url": "/metrics/timeseries",
         }
 
     app.include_router(health_router)
-    app.include_router(datasets_router)
-    app.include_router(query_router)
-    app.include_router(metrics_router)
+    app.include_router(chat_router)
+    app.include_router(datasets_router, dependencies=[Depends(require_api_access)])
+    app.include_router(query_router, dependencies=[Depends(require_api_access)])
+    app.include_router(metrics_router, dependencies=[Depends(require_api_access)])
+    app.include_router(sessions_router, dependencies=[Depends(require_api_access)])
 
     return app
 

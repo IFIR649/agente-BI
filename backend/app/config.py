@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     rate_limit_requests: int = 20
     rate_limit_window_seconds: int = 60
 
+    api_key: str = ""
     gemini_api_key: str = ""
     gemini_flash_model: str = "gemini-2.5-flash"
     gemini_pro_model: str = "gemini-2.5-flash"
@@ -46,6 +47,10 @@ class Settings(BaseSettings):
     allow_local_gemini_fallback: bool = True
     banxico_fix_url: str = "https://www.banxico.org.mx/tipcamb/tipCamIHAction.do"
     banxico_timeout_seconds: int = 10
+
+    session_timeout_seconds: int = 300
+    session_cleanup_interval_seconds: int = 60
+    max_concurrent_sessions: int = 50
 
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -535,6 +535,7 @@ def test_intent_parser_uses_local_fallback_when_all_models_timeout(tmp_path) -> 
     app.state.audit_logger.fx_resolver = app.state.fx_resolver
 
     with TestClient(app) as client:
+        client.headers.update({"X-API-Key": "test-api-key", "X-User-Id": "test-user"})
         upload = client.post(
             "/datasets/upload",
             files={"file": ("shape.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n2026-01-02,beta,150\n", "text/csv")},
@@ -593,6 +594,77 @@ def test_intent_parser_applies_cache_failure_cooldown(client: TestClient, app, u
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
     assert cache_attempts["count"] == 1
+
+
+def test_intent_parser_invalidates_missing_gemini_cached_content_and_retries_same_model(
+    client: TestClient,
+    app,
+    uploaded_shape_dataset: dict,
+) -> None:
+    dataset_id = uploaded_shape_dataset["id"]
+    parser: IntentParser = app.state.intent_parser
+    catalog = app.state.dataset_profiler.get_catalog(dataset_id)
+    assert catalog is not None
+
+    cache_key = parser._context_cache_key(catalog=catalog, model="gemini-2.5-flash")
+    parser._cached_contents[cache_key] = "cachedContents/stale-server-cache"
+    parser._cached_content_expires_at[cache_key] = datetime.now() + timedelta(hours=1)
+
+    queue_fake_gemini(
+        app,
+        structured=[
+            GeminiClientError(
+                "Error llamando Gemini: 403 PERMISSION_DENIED. {'error': {'message': 'CachedContent not found'}}"
+            ),
+            AgentDecision(kind="assistant_message", message="Cache renovado", reason="retry-ok"),
+        ],
+    )
+
+    response = client.post(
+        "/query",
+        json={"dataset_id": dataset_id, "question": "ventas por sucursal"},
+        headers={"X-User-Id": "usr_cache_refresh"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["message"] == "Cache renovado"
+    attempts = app.state._fake_gemini.structured_calls[-2:]
+    assert [call["model"] for call in attempts] == ["gemini-2.5-flash", "gemini-2.5-flash"]
+    assert attempts[0]["cached_content_name"] == "cachedContents/stale-server-cache"
+    assert attempts[1]["cached_content_name"] == "cachedContents/fake-1"
+    assert parser._cached_contents[cache_key] == "cachedContents/fake-1"
+
+
+def test_intent_parser_recreates_expired_local_cache_before_call(
+    client: TestClient,
+    app,
+    uploaded_shape_dataset: dict,
+) -> None:
+    dataset_id = uploaded_shape_dataset["id"]
+    parser: IntentParser = app.state.intent_parser
+    catalog = app.state.dataset_profiler.get_catalog(dataset_id)
+    assert catalog is not None
+
+    cache_key = parser._context_cache_key(catalog=catalog, model="gemini-2.5-flash")
+    parser._cached_contents[cache_key] = "cachedContents/expired-cache"
+    parser._cached_content_expires_at[cache_key] = datetime.now() - timedelta(seconds=5)
+
+    queue_fake_gemini(
+        app,
+        structured=[AgentDecision(kind="assistant_message", message="Cache nuevo", reason="fresh-cache")],
+    )
+
+    response = client.post(
+        "/query",
+        json={"dataset_id": dataset_id, "question": "ventas por fecha"},
+        headers={"X-User-Id": "usr_cache_expired"},
+    )
+
+    assert response.status_code == 200, response.text
+    attempt = app.state._fake_gemini.structured_calls[-1]
+    assert attempt["model"] == "gemini-2.5-flash"
+    assert attempt["cached_content_name"] == "cachedContents/fake-1"
+    assert parser._cached_contents[cache_key] == "cachedContents/fake-1"
 
 
 def test_query_aggregate_and_cache(client: TestClient, app, uploaded_shape_dataset: dict) -> None:
@@ -1081,11 +1153,69 @@ def test_gemini_structured_schema_does_not_include_additional_properties() -> No
     assert "additionalProperties" not in json.dumps(schema, ensure_ascii=True)
 
 
+def test_protected_routes_require_api_key(tmp_path) -> None:
+    app = create_app(build_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.get("/datasets")
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Falta X-API-Key."
+
+
+def test_protected_routes_require_user_id(tmp_path) -> None:
+    app = create_app(build_settings(tmp_path))
+    with TestClient(app) as client:
+        response = client.get("/datasets", headers={"X-API-Key": "test-api-key"})
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Falta X-User-Id."
+
+
+def test_open_routes_remain_accessible_without_api_key(tmp_path) -> None:
+    app = create_app(build_settings(tmp_path))
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/").status_code == 200
+        assert client.get("/analytics").status_code == 200
+        assert client.get("/api-info").status_code == 200
+        assert client.get("/openapi.json").status_code == 200
+
+
+def test_session_token_is_bound_to_same_user(client: TestClient) -> None:
+    created = client.post("/sessions", headers={"X-User-Id": "usr_owner"})
+    assert created.status_code == 201, created.text
+    token = created.json()["token"]
+
+    rejected = client.post(
+        f"/sessions/{token}/heartbeat",
+        headers={"X-API-Key": "test-api-key", "X-User-Id": "usr_other"},
+    )
+    assert rejected.status_code == 403
+    assert "no pertenece a este usuario" in rejected.json()["detail"]
+
+
+def test_session_token_is_bound_to_same_api_key(tmp_path) -> None:
+    app = create_app(build_settings(tmp_path))
+    with TestClient(app) as client:
+        created = client.post(
+            "/sessions",
+            headers={"X-API-Key": "test-api-key", "X-User-Id": "usr_owner"},
+        )
+        assert created.status_code == 201, created.text
+        token = created.json()["token"]
+
+        rejected = client.post(
+            f"/sessions/{token}/heartbeat",
+            headers={"X-API-Key": "wrong-key", "X-User-Id": "usr_owner"},
+        )
+        assert rejected.status_code == 403
+        assert rejected.json()["detail"] == "X-API-Key invalida."
+
+
 def test_rate_limit_is_enforced(tmp_path) -> None:
     app = create_app(build_settings(tmp_path, rate_limit_requests=1))
     install_fake_gemini(app)
 
     with TestClient(app) as client:
+        client.headers.update({"X-API-Key": "test-api-key", "X-User-Id": "test-user"})
         upload = client.post(
             "/datasets/upload",
             files={"file": ("shape.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n", "text/csv")},
@@ -1124,6 +1254,7 @@ def test_query_fails_when_gemini_is_not_configured(tmp_path) -> None:
     settings.allow_local_gemini_fallback = False
     app = create_app(settings)
     with TestClient(app) as client:
+        client.headers.update({"X-API-Key": "test-api-key", "X-User-Id": "test-user"})
         upload = client.post(
             "/datasets/upload",
             files={"file": ("shape.csv", "time_axis,group_axis,measure_axis\n2026-01-01,alpha,100\n", "text/csv")},
@@ -1163,15 +1294,31 @@ def test_metrics_endpoints_return_raw_and_summary(client: TestClient, app, uploa
     response = client.post(
         "/query",
         json={"dataset_id": uploaded_shape_dataset["id"], "question": "ventas por grupo"},
-        headers={"X-User-Id": "usr_metrics"},
+        headers={
+            "X-User-Id": "usr_metrics",
+            "X-User-Name": "Supervisor Metrics",
+            "X-Client-Id": "cliente-metrics",
+            "X-App-Session-Id": "app-metrics-001",
+        },
     )
     assert response.status_code == 200
 
-    raw = client.get("/metrics/queries", params={"dataset_id": uploaded_shape_dataset["id"], "user_id": "usr_metrics"})
+    raw = client.get(
+        "/metrics/queries",
+        params={
+            "dataset_id": uploaded_shape_dataset["id"],
+            "user_id": "usr_metrics",
+            "client_id": "cliente-metrics",
+            "app_session_id": "app-metrics-001",
+        },
+    )
     assert raw.status_code == 200, raw.text
     raw_payload = raw.json()
     assert raw_payload["total"] == 1
     assert raw_payload["items"][0]["query_id"]
+    assert raw_payload["items"][0]["client_id"] == "cliente-metrics"
+    assert raw_payload["items"][0]["app_session_id"] == "app-metrics-001"
+    assert raw_payload["items"][0]["actor_user_name"] == "Supervisor Metrics"
     assert raw_payload["items"][0]["llm_totals"]["call_count"] == 2
     assert raw_payload["items"][0]["llm_totals"]["input_token_count"] == 210
     assert raw_payload["items"][0]["llm_totals"]["total_cost_mxn"] == 0.0020774

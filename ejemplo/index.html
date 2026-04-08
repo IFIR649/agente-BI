@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ejemplo sesiones protegidas</title>
+  <style>
+    body{margin:0;font:14px/1.4 "Segoe UI",sans-serif;background:#f4efe3;color:#203033}
+    main{width:min(1100px,calc(100vw - 24px));margin:20px auto;display:grid;gap:14px}
+    .card{background:#fffdf8;border:1px solid #d9d7ce;border-radius:18px;padding:16px;box-shadow:0 10px 24px rgba(18,30,31,.05)}
+    .hero,.layout,.status{display:grid;gap:14px}.hero{grid-template-columns:1.2fr 1fr}.layout{grid-template-columns:360px 1fr}.status{grid-template-columns:repeat(4,1fr)}
+    h1,h2,p{margin:0 0 10px}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#166a63;font-weight:700}
+    label{display:grid;gap:6px;color:#657477}.grid{display:grid;gap:10px}.grid.two{grid-template-columns:repeat(2,1fr)}
+    input,textarea,button{font:inherit} input,textarea{width:100%;padding:10px 12px;border:1px solid #d9d7ce;border-radius:12px;background:#fff}
+    textarea{min-height:88px;resize:vertical} button{border:0;border-radius:999px;padding:11px 15px;font-weight:700;cursor:pointer}
+    .primary{background:#166a63;color:#fff}.secondary{background:#e8ece6;color:#203033}.ghost{background:transparent;border:1px solid #bdd3cf;color:#166a63}
+    button:disabled{opacity:.55;cursor:not-allowed}.row,.chips{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .meta,.note{color:#657477}.note.warn{color:#8c5a13}.note.error{color:#9c3d31}.note.success{color:#166a63}
+    .value{font-size:18px;font-weight:700}.label{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#657477;font-weight:700}
+    .messages{display:grid;gap:12px;min-height:340px;max-height:70vh;overflow:auto}.msg{border:1px solid #d9d7ce;border-radius:16px;padding:12px;background:#fff}
+    .msg.user{margin-left:auto;max-width:74%;background:linear-gradient(135deg,#166a63,#1f756d);color:#fff}.msg-head{font-size:12px;text-transform:uppercase;letter-spacing:.08em;font-weight:700;color:#657477;margin-bottom:6px}
+    .msg.user .msg-head{color:#d9f5f0}.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:10px}.kpi{border:1px solid #d9d7ce;border-radius:12px;padding:10px;background:#f2f6f4}
+    .kpi strong{display:block;font-size:22px;margin-top:6px} table{width:100%;border-collapse:collapse;margin-top:10px;background:#fff}
+    th,td{padding:9px 10px;border-bottom:1px solid #d9d7ce;text-align:left;vertical-align:top} th{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#657477;background:#f0f4f2}
+    .chip{padding:8px 11px;border:1px solid #d9d7ce;border-radius:999px;background:#fff}
+    @media (max-width:900px){.hero,.layout,.status,.grid.two{grid-template-columns:1fr}.msg.user{max-width:100%}}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card hero">
+      <div>
+        <p class="eyebrow">Ejemplo de integración</p>
+        <h1>API key global + sesión temporal + CSV + chat</h1>
+        <p>Este ejemplo usa la API protegida: manda <strong>X-API-Key</strong> y <strong>X-User-Id</strong>, crea una sesión, sube un CSV y consulta sobre ese archivo.</p>
+        <p class="note">El ejemplo usa cierre manual con el botón de sesión. Si el navegador o la pestaña se cierran, el backend la limpiará por timeout.</p>
+      </div>
+      <div class="grid two">
+        <label>API base<input id="apiBase" type="url" value="http://127.0.0.1:8000" /></label>
+        <label>API key<input id="apiKey" type="password" placeholder="Clave global" /></label>
+        <label>User ID<input id="userId" type="text" placeholder="usuario-web-01" /></label>
+        <div class="row" style="grid-column:1/-1">
+          <button id="saveAccessBtn" class="ghost" type="button">Guardar acceso</button>
+          <button id="createBtn" class="primary" type="button">Crear sesión</button>
+          <button id="closeBtn" class="secondary" type="button">Cerrar sesión</button>
+        </div>
+        <p id="accessNote" class="note" style="grid-column:1/-1">Captura API key y User ID para empezar.</p>
+      </div>
+    </section>
+
+    <section class="status">
+      <article class="card"><p class="label">Sesión</p><div id="sessionStatus" class="value">Sin sesión</div><div id="tokenStatus" class="meta">Token pendiente</div></article>
+      <article class="card"><p class="label">Dataset</p><div id="datasetStatus" class="value">Sin CSV</div><div id="datasetMeta" class="meta">Sube un archivo para habilitar el chat.</div></article>
+      <article class="card"><p class="label">Heartbeat</p><div id="heartbeatStatus" class="value">Inactivo</div><div id="heartbeatMeta" class="meta">Se activará al crear la sesión.</div></article>
+      <article class="card"><p class="label">Chat</p><div id="chatStatus" class="value">Esperando CSV</div><div id="chatMeta" class="meta">Todavía no hay dataset para consultar.</div></article>
+    </section>
+
+    <section class="layout">
+      <aside class="card">
+        <p class="eyebrow">Carga</p>
+        <h2>Sube el CSV</h2>
+        <div class="grid">
+          <label>Archivo CSV<input id="csvFile" type="file" accept=".csv,text/csv" /></label>
+          <label>Nombre visible<input id="displayName" type="text" placeholder="Ventas abril 2026" /></label>
+          <label>Descripción<textarea id="description" placeholder="Opcional"></textarea></label>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button id="uploadBtn" class="primary" type="button">Subir y activar CSV</button>
+          <button id="clearBtn" class="secondary" type="button">Limpiar chat</button>
+        </div>
+        <p id="uploadNote" class="note" style="margin-top:12px">Aún no hay CSV cargado.</p>
+        <div id="suggestions" class="chips" style="margin-top:12px"></div>
+      </aside>
+
+      <section class="card">
+        <p class="eyebrow">Chat</p>
+        <h2>Consulta el dataset activo</h2>
+        <p id="chatIntro" class="note">Cuando el CSV quede cargado, podrás hacer preguntas aquí mismo.</p>
+        <div id="messages" class="messages"></div>
+        <label style="margin-top:12px">Pregunta<textarea id="questionInput" placeholder="Ej. resumen general por área"></textarea></label>
+        <div class="row" style="margin-top:12px"><button id="sendBtn" class="primary" type="button">Enviar</button></div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const K={apiBase:"example.apiBase",apiKey:"example.apiKey",userId:"example.userId"};
+    const S={apiBase:"",apiKey:"",userId:"",token:"",dataset:null,history:[],heartbeat:0,lastBeat:0,busy:false};
+    const E={apiBase:q("apiBase"),apiKey:q("apiKey"),userId:q("userId"),saveAccessBtn:q("saveAccessBtn"),createBtn:q("createBtn"),closeBtn:q("closeBtn"),csvFile:q("csvFile"),displayName:q("displayName"),description:q("description"),uploadBtn:q("uploadBtn"),uploadNote:q("uploadNote"),suggestions:q("suggestions"),clearBtn:q("clearBtn"),messages:q("messages"),questionInput:q("questionInput"),sendBtn:q("sendBtn"),accessNote:q("accessNote"),sessionStatus:q("sessionStatus"),tokenStatus:q("tokenStatus"),datasetStatus:q("datasetStatus"),datasetMeta:q("datasetMeta"),heartbeatStatus:q("heartbeatStatus"),heartbeatMeta:q("heartbeatMeta"),chatStatus:q("chatStatus"),chatMeta:q("chatMeta"),chatIntro:q("chatIntro")};
+    document.addEventListener("DOMContentLoaded",init);
+
+    function init(){dbg("init:start");try{loadAccess()}catch(err){dbgError("init:load_access_error",{error:emsg(err)});S.apiBase="http://127.0.0.1:8000";S.apiKey=localStorage.getItem(K.apiKey)||"";S.userId=localStorage.getItem(K.userId)||gid();E.apiBase.value=S.apiBase;E.apiKey.value=S.apiKey;E.userId.value=S.userId;noteAccess(emsg(err),"error")}bind();resetChat();render();if(hasAccess())noteAccess("Acceso listo. Puedes crear la sesión.","success");dbg("init:ready",{hasAccess:hasAccess(),apiBase:S.apiBase,userId:S.userId})}
+    function bind(){E.saveAccessBtn.addEventListener("click",()=>{try{saveAccess();render()}catch(err){dbgError("access:save_error",{error:emsg(err)});noteAccess(emsg(err),"error")}});E.createBtn.addEventListener("click",()=>createSession(true).catch(err=>showError("No se pudo crear la sesión.",err)));E.closeBtn.addEventListener("click",()=>closeSession(false));E.uploadBtn.addEventListener("click",uploadCsv);E.sendBtn.addEventListener("click",sendQuestion);E.clearBtn.addEventListener("click",resetChat);E.questionInput.addEventListener("keydown",ev=>{if(ev.key==="Enter"&&!ev.shiftKey){ev.preventDefault();sendQuestion()}});E.suggestions.addEventListener("click",ev=>{const b=ev.target.closest("[data-question]");if(!b)return;E.questionInput.value=b.getAttribute("data-question")||"";E.questionInput.focus()})}
+
+    function loadAccess(){S.apiBase=norm(localStorage.getItem(K.apiBase)||E.apiBase.value);S.apiKey=localStorage.getItem(K.apiKey)||"";S.userId=localStorage.getItem(K.userId)||gid();E.apiBase.value=S.apiBase;E.apiKey.value=S.apiKey;E.userId.value=S.userId;dbg("access:loaded",{apiBase:S.apiBase,userId:S.userId,hasApiKey:Boolean(S.apiKey)})}
+    function saveAccess(){S.apiBase=norm(E.apiBase.value);S.apiKey=(E.apiKey.value||"").trim();S.userId=(E.userId.value||"").trim()||gid();localStorage.setItem(K.apiBase,S.apiBase);localStorage.setItem(K.apiKey,S.apiKey);localStorage.setItem(K.userId,S.userId);E.apiBase.value=S.apiBase;E.userId.value=S.userId;noteAccess(hasAccess()?"Acceso guardado.":"Captura API key y User ID para continuar.",hasAccess()?"success":"warn");dbg("access:saved",{apiBase:S.apiBase,userId:S.userId,hasApiKey:Boolean(S.apiKey)})}
+    function hasAccess(){return Boolean(S.apiKey&&S.userId)} function ensureAccess(){if(!hasAccess()){dbg("access:missing",{apiBase:S.apiBase,userId:S.userId,hasApiKey:Boolean(S.apiKey)});throw new Error("Captura API key y User ID antes de usar la sesión.")}}
+    function headers(extra={}){ensureAccess();return {"X-API-Key":S.apiKey,"X-User-Id":S.userId,...extra}}
+    async function call(path,opt={}){const isForm=opt.body instanceof FormData,hs=new Headers(headers(opt.headers||{}));if(!isForm&&!hs.has("Content-Type"))hs.set("Content-Type","application/json");const method=opt.method||"GET",baseUrl=norm(S.apiBase||E.apiBase.value);dbg("http:request",{method,path,baseUrl,token:S.token||null,isForm,hasDataset:Boolean(S.dataset)});let r;try{r=await fetch(`${baseUrl}${path}`,{...opt,headers:hs})}catch(cause){dbgError("http:network_error",{method,path,baseUrl,error:cause?.message||String(cause)});const e=new Error(`No se pudo conectar con ${baseUrl}.`);e.cause=cause;throw e}const ct=r.headers.get("content-type")||"",p=ct.includes("application/json")?await r.json():await r.text();dbg("http:response",{method,path,status:r.status,ok:r.ok,payload:safePayload(p)});if(!r.ok){const e=new Error(typeof p==="object"&&p?(p.detail||JSON.stringify(p)):String(p||`HTTP ${r.status}`));e.status=r.status;e.payload=p;throw e}return p}
+
+    async function createSession(forceNew){saveAccess();ensureAccess();dbg("session:create:start",{forceNew,token:S.token||null});if(forceNew&&S.token)await closeSession(true);busy(true);try{const p=await call("/sessions",{method:"POST",body:JSON.stringify({user_id:S.userId})});S.token=p.token;S.dataset=null;S.history=[];S.lastBeat=Date.now();dbg("session:create:ok",{token:S.token,expiresIn:p.expires_in});startBeat();resetChat();noteUpload("Sesión activa. El siguiente paso es subir un CSV.","success");msg("system","Sistema","Sesión creada. Ahora sube un CSV para habilitar el chat.");render();return p}catch(err){dbgError("session:create:error",{error:emsg(err),status:err?.status||null});throw err}finally{busy(false)}}
+    async function uploadCsv(){saveAccess();ensureAccess();const f=E.csvFile.files[0];if(!f){noteUpload("Selecciona un archivo CSV antes de subirlo.","warn");dbg("upload:missing_file");return}if(!f.name.toLowerCase().endsWith(".csv")){noteUpload("Solo se esperan archivos .csv.","warn");dbg("upload:invalid_extension",{filename:f.name});return}try{busy(true);dbg("upload:start",{filename:f.name,size:f.size,token:S.token||null});if(!S.token)await createSession(false);const fd=new FormData(),m={};fd.append("file",f,f.name);if(E.displayName.value.trim())m.display_name=E.displayName.value.trim();if(E.description.value.trim())m.description=E.description.value.trim();if(Object.keys(m).length)fd.append("metadata",JSON.stringify(m));const d=await call(`/sessions/${encodeURIComponent(S.token)}/upload`,{method:"POST",body:fd});S.dataset=d;S.history=[];dbg("upload:ok",{token:S.token,datasetId:d.id,displayName:d.display_name||d.filename});resetChat();noteUpload("Archivo subido y sesión lista para consultar.","success");msg("assistant","Agente",`CSV cargado correctamente: <strong>${esc(d.display_name||d.filename)}</strong>.`);renderHints([`resumen general de ${d.display_name||d.filename}`,"top 5 por área","tendencia mensual","comparado con el periodo anterior"]);render()}catch(err){dbgError("upload:error",{error:emsg(err),status:err?.status||null,token:S.token||null});showError("No se pudo subir el CSV.",err)}finally{busy(false)}}
+    async function sendQuestion(){saveAccess();ensureAccess();const question=E.questionInput.value.trim();if(!question){dbg("query:empty_question");return}if(!S.token||!S.dataset){dbg("query:blocked_missing_session_or_dataset",{token:S.token||null,hasDataset:Boolean(S.dataset)});showError("Todavía no hay un dataset activo.",new Error("Primero crea la sesión y sube un CSV."));return}msg("user","Tu consulta",`<p>${esc(question)}</p>`);E.questionInput.value="";try{busy(true);dbg("query:start",{token:S.token,question:question.slice(0,120),historyCount:S.history.slice(-12).length});const r=await call(`/sessions/${encodeURIComponent(S.token)}/query`,{method:"POST",body:JSON.stringify({question,history:S.history.slice(-12)})});dbg("query:ok",{token:S.token,status:r.status});if(r.status==="ok"){msg("assistant","Agente",renderResult(r));remember("user",question);remember("agent",r.summary);renderHintsFromResponse(r);render();return}if(r.status==="needs_clarification"){msg("assistant","Agente",`<p>${esc(r.reason)}</p><p>${esc(r.question)}</p>`);remember("user",question);remember("agent",`${r.reason} ${r.question}`.trim());renderHints((r.hints||[]));return}if(r.status==="assistant_message"){msg("assistant","Agente",`<p>${esc(r.message)}</p>`);remember("user",question);remember("agent",r.message);renderHints((r.hints||[]));return}throw new Error("El backend devolvió un estado no esperado.")}catch(err){dbgError("query:error",{error:emsg(err),status:err?.status||null,token:S.token||null});showError("La consulta falló.",err);if(err.status===401||err.status===403)expire("La sesión ya no es válida para este acceso. Crea una nueva.")}finally{busy(false)}}
+
+    function startBeat(){stopBeat();dbg("heartbeat:start",{token:S.token||null});S.heartbeat=window.setInterval(async()=>{if(!S.token){dbg("heartbeat:skip_no_token");return}try{dbg("heartbeat:tick",{token:S.token});await call(`/sessions/${encodeURIComponent(S.token)}/heartbeat`,{method:"POST"});S.lastBeat=Date.now();render()}catch(err){dbgError("heartbeat:error",{error:emsg(err),status:err?.status||null,token:S.token||null});stopBeat();if(err.status===401||err.status===403){expire("El backend marcó la sesión como expirada o inválida.");return}noteUpload(`Heartbeat falló: ${emsg(err)}`,"warn")}},30000);render()}
+    function stopBeat(){if(S.heartbeat){dbg("heartbeat:stop",{token:S.token||null});clearInterval(S.heartbeat);S.heartbeat=0}render()}
+    async function closeSession(silent){dbg("session:close:start",{token:S.token||null,silent});stopBeat();if(S.token){try{await fetch(`${norm(S.apiBase||E.apiBase.value)}/sessions/${encodeURIComponent(S.token)}/logout`,{method:"POST",keepalive:true,headers:headers()});dbg("session:close:logout_ok",{token:S.token})}catch(err){dbgError("session:close:logout_error",{error:err?.message||String(err),token:S.token||null});if(!silent)noteUpload("No se pudo cerrar la sesión en el servidor. El heartbeat se encargará de limpiarla.","warn")}}S.token="";S.dataset=null;S.history=[];S.lastBeat=0;E.csvFile.value="";resetChat();render();if(!silent)msg("system","Sistema","Sesión cerrada. Si quieres cambiar el CSV, crea una nueva.")}
+    function expire(text){dbgError("session:expired",{token:S.token||null,text});stopBeat();S.token="";S.dataset=null;S.history=[];S.lastBeat=0;resetChat();noteUpload("La sesión expiró. Crea otra y vuelve a subir el CSV.","warn");msg("system","Sistema",text);render()}
+
+    function resetChat(){E.messages.innerHTML="";msg("assistant","Agente","Cuando el CSV quede cargado, el chat responderá sobre ese archivo. Ejemplos: <strong>resumen general</strong>, <strong>top 5 por área</strong>, <strong>tendencia mensual</strong>.");renderHints([])}
+    function msg(role,title,html){const n=document.createElement("article");n.className=`msg ${role}`;n.innerHTML=`<div class="msg-head">${esc(title)}</div><div>${html}</div>`;E.messages.appendChild(n);E.messages.scrollTop=E.messages.scrollHeight}
+    function remember(role,text){S.history.push({role,text});S.history=S.history.slice(-12)}
+    function renderResult(r){const summary=`<p>${esc(r.summary||"Sin resumen.")}</p>`,kpis=Array.isArray(r.kpis)&&r.kpis.length?`<div class="kpis">${r.kpis.map(k=>`<div class="kpi"><span class="label">${esc(k.label||"KPI")}</span><strong>${esc(fmt(k.value))}</strong>${k.change?`<span class="note">${esc(k.change)}</span>`:""}</div>`).join("")}</div>`:"",table=r.table&&Array.isArray(r.table.columns)&&r.table.columns.length?`<details><summary>Ver tabla (${r.table.rows.length} filas)</summary>${renderTable(r.table)}</details>`:"";return summary+kpis+table}
+    function renderTable(t){return `<table><thead><tr>${t.columns.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${t.rows.map(row=>`<tr>${t.columns.map(c=>`<td>${esc(fmt(row[c]))}</td>`).join("")}</tr>`).join("")}</tbody></table>`}
+    function renderHintsFromResponse(r){if(!r?.meta?.plan){renderHints([]);return}const p=r.meta.plan,h=[];if(p.dimensions?.length)h.push(`top 5 ${p.dimensions[0]} por ${p.metrics?.[0]||"valor"}`);if(p.metrics?.length)h.push(`total de ${p.metrics[0]}`);if(p.intent==="time_series_report")h.push("comparado con el periodo anterior");renderHints(h)}
+    function renderHints(items){const unique=[...new Set((items||[]).map(v=>String(v).trim()).filter(Boolean))];E.suggestions.innerHTML=unique.map(v=>`<button class="chip" type="button" data-question="${eattr(v)}">${esc(v)}</button>`).join("")}
+    function noteUpload(text,tone=""){E.uploadNote.textContent=text;E.uploadNote.className=tone?`note ${tone}`:"note"} function noteAccess(text,tone=""){E.accessNote.textContent=text;E.accessNote.className=tone?`note ${tone}`:"note"} function busy(v){S.busy=v;render()}
+    function render(){E.sessionStatus.textContent=S.token?"Activa":"Sin sesión";E.tokenStatus.textContent=S.token||"Token pendiente";E.datasetStatus.textContent=S.dataset?(S.dataset.display_name||S.dataset.filename):"Sin CSV";E.datasetMeta.textContent=S.dataset?`${num(S.dataset.row_count)} filas · ${num(Object.keys(S.dataset.columns||{}).length)} columnas`:"Sube un archivo para habilitar el chat.";E.heartbeatStatus.textContent=S.heartbeat?"Activo":"Inactivo";E.heartbeatMeta.textContent=S.heartbeat?`Último ping: ${S.lastBeat?new Date(S.lastBeat).toLocaleTimeString():"recién creado"}`:"Se activará al crear la sesión.";E.chatStatus.textContent=S.dataset?"Listo para preguntar":"Esperando CSV";E.chatMeta.textContent=S.dataset?"La consulta viaja con historial corto a la sesión activa.":"Todavía no hay dataset para consultar.";E.chatIntro.textContent=S.dataset?`Dataset activo: ${S.dataset.display_name||S.dataset.filename}`:"Cuando el CSV quede cargado, podrás hacer preguntas aquí mismo.";const blocked=!hasAccess();E.createBtn.disabled=S.busy||blocked;E.closeBtn.disabled=S.busy||!S.token;E.uploadBtn.disabled=S.busy||blocked;E.sendBtn.disabled=S.busy||blocked||!S.token||!S.dataset;E.questionInput.disabled=S.busy||blocked||!S.token||!S.dataset}
+
+    function num(v){const n=Number(v);return Number.isNaN(n)?String(v??""):new Intl.NumberFormat("es-MX").format(n)} function fmt(v){if(v===null||v===undefined||v==="")return"N/A";if(typeof v==="number")return new Intl.NumberFormat("es-MX",{maximumFractionDigits:2}).format(v);return String(v)}
+    function showError(prefix,err){noteUpload(`${prefix} ${emsg(err)}`,"error");msg("system","Sistema",esc(`${prefix} ${emsg(err)}`));render()} function emsg(err){return err?.message||"Error no identificado."}
+    function dbg(event,data={}){try{console.info("[ejemplo-chat]",event,{...data,state:{token:S.token||null,hasDataset:Boolean(S.dataset),busy:S.busy,heartbeat:Boolean(S.heartbeat)}})}catch(_){}}
+    function dbgError(event,data={}){try{console.error("[ejemplo-chat]",event,{...data,state:{token:S.token||null,hasDataset:Boolean(S.dataset),busy:S.busy,heartbeat:Boolean(S.heartbeat)}})}catch(_){}}
+    function safePayload(payload){if(payload===null||payload===undefined)return payload;if(typeof payload==="string")return payload.slice(0,400);if(Array.isArray(payload))return {type:"array",length:payload.length};if(typeof payload==="object"){const out={};for(const [k,v] of Object.entries(payload)){if(k==="telemetry"){out[k]="[telemetry]";continue}if(typeof v==="string")out[k]=v.slice(0,240);else if(Array.isArray(v))out[k]=`[array:${v.length}]`;else if(v&&typeof v==="object")out[k]="[object]";else out[k]=v}return out}return payload}
+    function q(id){return document.getElementById(id)} function norm(v){const raw=String(v||"").trim();if(!raw)throw new Error("La API base no puede estar vacía.");let fixed=raw.replace(/^(https?):(?!\/\/)/i,"$1://");if(!/^https?:\/\//i.test(fixed))fixed=`http://${fixed.replace(/^\/+/,"")}`;fixed=fixed.replace(/\/+$/,"");try{const url=new URL(fixed);if(!url.hostname)throw new Error("Sin hostname");return url.origin}catch(_){throw new Error(`API base inválida: ${raw}`)}} function gid(){return `web-${id()}`} function esc(v){return String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('\"',"&quot;").replaceAll("'","&#39;")} function eattr(v){return String(v??"").replaceAll("&","&amp;").replaceAll('\"',"&quot;").replaceAll("'","&#39;")}
+    function id(){try{if(window.crypto&&typeof window.crypto.randomUUID==="function")return window.crypto.randomUUID()}catch(_){}try{if(window.crypto&&typeof window.crypto.getRandomValues==="function"){const b=new Uint8Array(16);window.crypto.getRandomValues(b);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;const h=Array.from(b,x=>x.toString(16).padStart(2,"0"));return [h.slice(0,4).join(""),h.slice(4,6).join(""),h.slice(6,8).join(""),h.slice(8,10).join(""),h.slice(10,16).join("")].join("-")}}catch(_){}return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,12)}`}
+  </script>
+</body>
+</html>

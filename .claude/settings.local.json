@@ -3,7 +3,9 @@
     "allow": [
       "Bash(xargs grep:*)",
       "Bash(./env/Scripts/python.exe -m pytest backend/tests -q)",
-      "Bash(pwsh -File ./scripts/backend-test.ps1)"
+      "Bash(pwsh -File ./scripts/backend-test.ps1)",
+      "Bash(find \"C:\\\\n8n\\\\vfp-python_x64-html5\" -name \"*.py\" -type f -exec grep -l \"datasets\\\\|chat\\\\|agente\" {} \\\\;)",
+      "Bash(.\\\\env\\\\Scripts\\\\python.exe -m pytest backend/tests/test_sessions.py -v)"
     ]
   }
 }

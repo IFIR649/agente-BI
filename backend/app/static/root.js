@@ -1,20 +1,43 @@
+const VIEW_NAMES = {
+  loading: "loading",
+  waiting: "waiting",
+  select: "select",
+  upload: "upload",
+  chat: "chat",
+};
+
 const state = {
   datasets: [],
   activeDataset: null,
   messages: [],
+  view: VIEW_NAMES.loading,
+  mode: "session",
   isUploading: false,
   isSubmitting: false,
+  heartbeatTimer: null,
 };
 
 const palette = ["#166a63", "#d97a36", "#355c7d", "#8b5a2b", "#7a3b69", "#2d7a4f", "#a84a35"];
 const STORAGE_KEYS = {
-  chatHistory: "chat-history-prod",
+  chatHistoryPrefix: "chat-history-prod",
+  apiKey: "csv-agent-api-key",
   userId: "csv-agent-user-id",
+  sessionToken: "csv-agent-session-token",
+  sessionUserId: "csv-agent-session-user-id",
 };
 
 const elements = {
+  authCard: document.getElementById("auth-card"),
+  apiKeyInput: document.getElementById("api-key-input"),
+  actorUserIdInput: document.getElementById("actor-user-id-input"),
+  authSave: document.getElementById("auth-save"),
+  authStatusText: document.getElementById("auth-status-text"),
   activeDatasetChip: document.getElementById("active-dataset-chip"),
+  logoutSession: document.getElementById("logout-session"),
   datasetStateText: document.getElementById("dataset-state-text"),
+  loadingStage: document.getElementById("loading-stage"),
+  sessionStage: document.getElementById("session-stage"),
+  sessionStageText: document.getElementById("session-stage-text"),
   selectorStage: document.getElementById("selector-stage"),
   selectorList: document.getElementById("selector-list"),
   uploadStage: document.getElementById("upload-stage"),
@@ -24,6 +47,7 @@ const elements = {
   uploadSubmit: document.getElementById("upload-submit"),
   uploadStatusText: document.getElementById("upload-status-text"),
   uploadStatusBadge: document.getElementById("upload-status-badge"),
+  chatStage: document.getElementById("chat-stage"),
   chatTranscript: document.getElementById("chat-transcript"),
   promptCard: document.getElementById("prompt-card"),
   queryForm: document.getElementById("query-form"),
@@ -36,27 +60,51 @@ const elements = {
 };
 
 document.addEventListener("DOMContentLoaded", () => {
+  captureTokenModeFromUrl();
   bindEvents();
   bootstrap();
 });
 
 async function bootstrap() {
-  ensureUserId();
-  loadSessionHistory();
-  if (!state.messages.length) {
-    pushMessage({
-      role: "agent",
-      text: "Activa un CSV para comenzar. Cuando haya un dataset activo, podras consultarlo desde este chat.",
-    });
+  stopHeartbeat();
+  state.mode = hasStoredTokenSession() ? "token" : "session";
+  syncAuthInputs();
+  clearChatState();
+  setView(VIEW_NAMES.loading);
+  renderChat();
+  renderSuggestions(null);
+  updateComposerState();
+  updateAccessVisibility();
+
+  if (isTokenMode()) {
+    setAuthStatus("Sesion temporal vinculada desde la API.", "success");
+    try {
+      await hydrateTokenExperience();
+      syncViewWithState();
+      updateViewState();
+      return;
+    } catch (error) {
+      clearTokenSession();
+      state.mode = "session";
+      updateAccessVisibility();
+      setAuthStatus((error?.message || "La sesion temporal ya no es valida.") + " Reabre el chat desde Visual FoxPro.", "error");
+      clearChatState();
+    }
   }
 
-  await hydrateExperience();
-  renderChat();
+  state.mode = "session";
+  setAuthStatus("Este chat se habilita cuando Visual FoxPro crea una sesion temporal y abre esta URL.", "warn");
+  setDatasetState("Esperando una sesion temporal del sistema.", "warn");
+  syncViewWithState();
   updateViewState();
-  updateComposerState();
 }
 
 function bindEvents() {
+  elements.authSave?.addEventListener("click", () => {
+    saveAuthInputs();
+    bootstrap();
+  });
+  elements.logoutSession?.addEventListener("click", handleTokenLogout);
   elements.uploadForm?.addEventListener("submit", handleUploadSubmit);
   elements.queryForm.addEventListener("submit", handleQuerySubmit);
   elements.suggestions.addEventListener("click", handleSuggestionClick);
@@ -64,14 +112,16 @@ function bindEvents() {
   elements.chatTranscript.addEventListener("click", handleTranscriptClick);
 
   elements.clearChat?.addEventListener("click", () => {
+    if (!state.activeDataset) {
+      return;
+    }
+
+    clearCurrentChatHistory();
     state.messages = [];
-    sessionStorage.removeItem(STORAGE_KEYS.chatHistory);
     renderChat();
     pushMessage({
       role: "agent",
-      text: state.activeDataset
-        ? `Chat limpiado. Puedes seguir consultando ${state.activeDataset.display_name}.`
-        : "Chat limpiado. Activa un CSV para continuar.",
+      text: `Chat limpiado. Puedes seguir consultando ${state.activeDataset.display_name}.`,
     });
   });
 
@@ -85,25 +135,32 @@ function bindEvents() {
   });
 }
 
-async function hydrateExperience() {
+async function hydrateManualExperience() {
   setDatasetState("Cargando dataset activo...", "warn");
 
-  try {
-    const activeDataset = await loadActiveDataset();
-    if (activeDataset) {
-      state.activeDataset = activeDataset;
-      return;
-    }
-
-    await loadDatasets();
-  } catch (error) {
-    setDatasetState(error.message, "error");
+  const activeDataset = await loadActiveDataset();
+  if (activeDataset) {
+    enterChatView(activeDataset);
+    return;
   }
+
+  clearChatState();
+  renderChat();
+  renderSuggestions(null);
+  await loadDatasets();
+}
+
+async function hydrateTokenExperience() {
+  setDatasetState("Recuperando sesion temporal...", "warn");
+  const sessionState = await loadTokenSessionState();
+  enterChatView(sessionState.dataset, { focusComposer: false });
+  startHeartbeat();
 }
 
 async function loadActiveDataset() {
+  ensureApiAccess();
   const response = await fetch("/datasets/active", {
-    headers: { "X-User-Id": ensureUserId() },
+    headers: buildApiHeaders(),
   });
   const payload = await parseJsonResponse(response);
 
@@ -116,8 +173,30 @@ async function loadActiveDataset() {
   return payload;
 }
 
+async function loadTokenSessionState() {
+  const response = await fetch("/chat/session", {
+    headers: buildSessionHeaders(),
+  });
+  const payload = await parseJsonResponse(response);
+
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(payload.detail || "La sesion temporal expiro o no es valida.");
+  }
+  if (response.status === 412) {
+    throw new Error(payload.detail || "La sesion temporal no tiene un dataset cargado.");
+  }
+  if (!response.ok) {
+    throw new Error(payload.detail || "No se pudo recuperar la sesion temporal.");
+  }
+
+  return payload;
+}
+
 async function loadDatasets() {
-  const response = await fetch("/datasets");
+  ensureApiAccess();
+  const response = await fetch("/datasets", {
+    headers: buildApiHeaders(),
+  });
   const payload = await parseJsonResponse(response);
   if (!response.ok) {
     throw new Error(payload.detail || "No se pudieron cargar los datasets.");
@@ -128,13 +207,11 @@ async function loadDatasets() {
 
 async function activateDataset(datasetId) {
   setDatasetState("Activando CSV...", "warn");
+  ensureApiAccess();
 
   const response = await fetch("/datasets/active", {
     method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "X-User-Id": ensureUserId(),
-    },
+    headers: buildApiHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ dataset_id: datasetId }),
   });
   const payload = await parseJsonResponse(response);
@@ -142,13 +219,14 @@ async function activateDataset(datasetId) {
     throw new Error(payload.detail || "No se pudo activar el dataset.");
   }
 
-  state.activeDataset = payload;
-  updateViewState();
+  enterChatView(payload, { focusComposer: true });
 }
 
 async function handleUploadSubmit(event) {
   event.preventDefault();
-  if (state.isUploading) return;
+  if (state.isUploading) {
+    return;
+  }
 
   const file = elements.uploadFile.files[0];
   if (!file) {
@@ -161,6 +239,7 @@ async function handleUploadSubmit(event) {
   setUploadStatus("Subiendo y activando CSV...", "warn", "Subiendo");
 
   try {
+    ensureApiAccess();
     const formData = new FormData();
     formData.append("file", file);
     const displayName = elements.uploadDisplayName.value.trim();
@@ -170,7 +249,7 @@ async function handleUploadSubmit(event) {
 
     const response = await fetch("/datasets/upload", {
       method: "POST",
-      headers: { "X-User-Id": ensureUserId() },
+      headers: buildApiHeaders(),
       body: formData,
     });
     const payload = await parseJsonResponse(response);
@@ -178,15 +257,14 @@ async function handleUploadSubmit(event) {
       throw new Error(payload.detail || "No se pudo subir el dataset.");
     }
 
-    state.activeDataset = payload;
-    state.datasets = [payload];
+    state.datasets = mergeDatasetIntoList(payload);
     elements.uploadForm.reset();
     setUploadStatus(
       `Dataset listo: ${payload.display_name} (${formatNumber(payload.row_count)} filas)`,
       "success",
       "Listo",
     );
-    updateViewState();
+    enterChatView(payload, { focusComposer: true });
   } catch (error) {
     setUploadStatus(error.message, "error", "Error");
   } finally {
@@ -197,11 +275,15 @@ async function handleUploadSubmit(event) {
 
 async function handleQuerySubmit(event) {
   event.preventDefault();
-  if (state.isSubmitting) return;
+  if (state.isSubmitting) {
+    return;
+  }
 
   const question = elements.queryInput.value.trim();
   const history = buildHistoryPayload();
-  if (!state.activeDataset || !question) return;
+  if (!state.activeDataset || !question) {
+    return;
+  }
 
   state.isSubmitting = true;
   let thinkingId = null;
@@ -212,21 +294,25 @@ async function handleQuerySubmit(event) {
     thinkingId = pushMessage({ role: "thinking", text: renderThinkingMarkup(), html: true });
     elements.queryInput.value = "";
 
-    const response = await fetch("/query", {
+    const requestInit = buildChatMessageRequest(question, history);
+    const response = await fetch(requestInit.url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-User-Id": ensureUserId(),
-      },
-      body: JSON.stringify({
-        dataset_id: state.activeDataset.id,
-        question,
-        history,
-      }),
+      headers: requestInit.headers,
+      body: requestInit.body,
     });
 
     const payload = await parseJsonResponse(response);
     removeMessage(thinkingId);
+
+    if ((response.status === 401 || response.status === 403) && isTokenMode()) {
+      pushMessage({
+        role: "system",
+        text: payload.detail || "La sesion temporal expiro o ya no es valida. Reabre el chat desde VFP.",
+      });
+      clearTokenSession();
+      bootstrap();
+      return;
+    }
 
     if (!response.ok) {
       const detail = typeof payload.detail === "string"
@@ -279,14 +365,18 @@ async function handleQuerySubmit(event) {
 
 function handleSuggestionClick(event) {
   const button = event.target.closest(".suggestion");
-  if (!button) return;
+  if (!button) {
+    return;
+  }
   elements.queryInput.value = button.dataset.question || "";
   elements.queryInput.focus();
 }
 
 function handleSelectorClick(event) {
   const button = event.target.closest("[data-dataset-id]");
-  if (!button) return;
+  if (!button) {
+    return;
+  }
 
   activateDataset(button.dataset.datasetId).catch((error) => {
     setDatasetState(error.message, "error");
@@ -295,32 +385,90 @@ function handleSelectorClick(event) {
 
 function handleTranscriptClick(event) {
   const button = event.target.closest(".hint-action");
-  if (!button) return;
+  if (!button) {
+    return;
+  }
   elements.queryInput.value = button.dataset.hint || "";
   elements.queryInput.focus();
 }
 
+function enterChatView(dataset, options = {}) {
+  state.activeDataset = dataset;
+  state.datasets = mergeDatasetIntoList(dataset);
+  setView(VIEW_NAMES.chat);
+  restoreChatHistory(dataset.id);
+  ensureChatGreeting();
+  if (isTokenMode()) {
+    startHeartbeat();
+  }
+  updateViewState();
+
+  if (options.focusComposer) {
+    elements.queryInput.focus();
+  }
+}
+
+function syncViewWithState() {
+  if (isTokenMode()) {
+    setView(state.activeDataset ? VIEW_NAMES.chat : VIEW_NAMES.loading);
+    return;
+  }
+  setView(VIEW_NAMES.waiting);
+}
+
+function setView(view) {
+  state.view = view;
+  setStageVisible(elements.loadingStage, view === VIEW_NAMES.loading);
+  setStageVisible(elements.sessionStage, view === VIEW_NAMES.waiting);
+  setStageVisible(elements.selectorStage, view === VIEW_NAMES.select);
+  setStageVisible(elements.uploadStage, view === VIEW_NAMES.upload);
+  setStageVisible(elements.chatStage, view === VIEW_NAMES.chat);
+}
+
+function setStageVisible(element, visible) {
+  if (!element) {
+    return;
+  }
+  element.style.display = visible ? "" : "none";
+  element.hidden = !visible;
+  element.setAttribute("aria-hidden", visible ? "false" : "true");
+}
+
 function updateViewState() {
   const hasActiveDataset = Boolean(state.activeDataset);
-  const hasDatasets = state.datasets.length > 0;
+  const tokenMode = isTokenMode();
 
   elements.activeDatasetChip.textContent = hasActiveDataset
     ? state.activeDataset.display_name
     : "Sin dataset activo";
-  elements.chatTranscript.hidden = !hasActiveDataset;
-  elements.promptCard.hidden = !hasActiveDataset;
-  elements.selectorStage.hidden = hasActiveDataset || !hasDatasets;
-  elements.uploadStage.hidden = hasActiveDataset || hasDatasets;
+  elements.clearChat.disabled = !hasActiveDataset;
+  if (elements.logoutSession) {
+    elements.logoutSession.hidden = !tokenMode;
+    elements.logoutSession.style.display = tokenMode ? "" : "none";
+  }
 
-  if (hasActiveDataset) {
-    setDatasetState(`CSV activo: ${state.activeDataset.display_name}`, "success");
+  if (state.view === VIEW_NAMES.chat && hasActiveDataset) {
+    setDatasetState(
+      tokenMode
+        ? `Sesion temporal activa · CSV: ${state.activeDataset.display_name}`
+        : `CSV activo: ${state.activeDataset.display_name}`,
+      "success",
+    );
     renderSuggestions(state.activeDataset);
-  } else if (hasDatasets) {
+  } else if (state.view === VIEW_NAMES.waiting) {
+    setDatasetState("Esperando una sesion temporal vinculada al CSV.", "warn");
+    elements.selectorList.innerHTML = "";
+    renderSuggestions(null);
+  } else if (state.view === VIEW_NAMES.select) {
     setDatasetState("Selecciona el CSV que quieres activar para este navegador.", "warn");
     renderSelectorList();
     renderSuggestions(null);
-  } else {
+  } else if (state.view === VIEW_NAMES.upload) {
     setDatasetState("No hay datasets activos. Sube un CSV para comenzar.", "warn");
+    elements.selectorList.innerHTML = "";
+    renderSuggestions(null);
+  } else {
+    elements.selectorList.innerHTML = "";
     renderSuggestions(null);
   }
 
@@ -357,7 +505,6 @@ function renderSuggestions(dataset) {
 
 function buildSuggestions(dataset) {
   const suggestions = [];
-
   const metricLabel = metricLabelByName(dataset, dataset.default_metric);
   const dimensionName = dataset.suggested_dimensions?.[0];
   const dimensionLabel = dimensionName ? dimensionLabelByName(dataset, dimensionName) : null;
@@ -380,7 +527,25 @@ function buildSuggestions(dataset) {
   return suggestions.slice(0, 4);
 }
 
+function restoreChatHistory(datasetId) {
+  state.messages = [];
+  try {
+    const raw = sessionStorage.getItem(historyStorageKey(datasetId));
+    if (!raw) {
+      return;
+    }
+    const messages = JSON.parse(raw);
+    if (Array.isArray(messages)) {
+      state.messages = messages;
+    }
+  } catch (_) {}
+}
+
 function saveSessionHistory() {
+  if (!state.activeDataset) {
+    return;
+  }
+
   try {
     const serializable = state.messages
       .filter((message) => message.role !== "thinking")
@@ -393,23 +558,34 @@ function saveSessionHistory() {
         subtitle: message.subtitle || null,
         meta: message.meta || null,
       }));
-    sessionStorage.setItem(STORAGE_KEYS.chatHistory, JSON.stringify(serializable));
+    sessionStorage.setItem(historyStorageKey(state.activeDataset.id), JSON.stringify(serializable));
   } catch (_) {}
 }
 
-function loadSessionHistory() {
+function clearCurrentChatHistory() {
+  if (!state.activeDataset) {
+    return;
+  }
   try {
-    const raw = sessionStorage.getItem(STORAGE_KEYS.chatHistory);
-    if (!raw) return;
-    const messages = JSON.parse(raw);
-    if (Array.isArray(messages)) {
-      state.messages = messages;
-    }
+    sessionStorage.removeItem(historyStorageKey(state.activeDataset.id));
   } catch (_) {}
+}
+
+function historyStorageKey(datasetId) {
+  return `${STORAGE_KEYS.chatHistoryPrefix}:${currentUserId()}:${datasetId}`;
+}
+
+function clearChatState() {
+  state.activeDataset = null;
+  state.messages = [];
 }
 
 function renderChat() {
   elements.chatTranscript.innerHTML = "";
+  if (state.view !== VIEW_NAMES.chat || !state.activeDataset) {
+    return;
+  }
+
   for (const message of state.messages) {
     const fragment = elements.messageTemplate.content.cloneNode(true);
     const article = fragment.querySelector(".message");
@@ -419,11 +595,18 @@ function renderChat() {
     article.classList.add(message.role);
     article.dataset.messageId = message.id;
     label.textContent = labelForRole(message.role, message.subtitle);
+    body.classList.toggle("plain-text", false);
+    body.classList.toggle("rich-text", false);
 
     if (message.html) {
       body.innerHTML = message.text;
+      body.classList.add("rich-text");
+    } else if (shouldRenderRichTextMessage(message)) {
+      body.innerHTML = renderRichTextMessage(message.text);
+      body.classList.add("rich-text");
     } else {
       body.textContent = message.text;
+      body.classList.add("plain-text");
     }
 
     if (message.hints?.length) {
@@ -453,9 +636,20 @@ function renderChat() {
   saveSessionHistory();
 }
 
+function ensureChatGreeting() {
+  if (!state.activeDataset || state.messages.length) {
+    return;
+  }
+  pushMessage({
+    role: "agent",
+    text: `CSV activo: ${state.activeDataset.display_name}. Puedes empezar a consultar este dataset.`,
+  });
+}
+
 function updateComposerState(overrideText) {
   const hasDataset = Boolean(state.activeDataset);
-  const disabled = !hasDataset || state.isSubmitting;
+  const chatReady = hasDataset && state.view === VIEW_NAMES.chat;
+  const disabled = !chatReady || state.isSubmitting;
   elements.querySubmit.disabled = disabled;
   elements.queryInput.disabled = disabled;
 
@@ -465,7 +659,7 @@ function updateComposerState(overrideText) {
     return;
   }
 
-  if (!hasDataset) {
+  if (!chatReady) {
     elements.queryStatusText.textContent = "Activa un dataset para habilitar el chat.";
     elements.queryStatusText.className = "status-text";
   } else if (state.isSubmitting) {
@@ -522,6 +716,159 @@ function extractTextFromHtml(html) {
   return div.querySelector(".inline-summary")?.textContent || div.textContent || "";
 }
 
+function shouldRenderRichTextMessage(message) {
+  return !message.html && (message.role === "agent" || message.role === "system");
+}
+
+function renderRichTextMessage(text) {
+  const normalized = String(text ?? "")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+
+  if (!normalized) {
+    return "";
+  }
+
+  const chunks = [];
+  const lines = normalized.split("\n");
+  const paragraph = [];
+
+  const flushParagraph = () => {
+    if (!paragraph.length) {
+      return;
+    }
+    chunks.push(`<p>${paragraph.map((line) => renderInlineMarkdown(line)).join("<br>")}</p>`);
+    paragraph.length = 0;
+  };
+
+  for (let index = 0; index < lines.length; ) {
+    const rawLine = lines[index];
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      flushParagraph();
+      index += 1;
+      continue;
+    }
+
+    const headingMatch = rawLine.match(/^\s*(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      flushParagraph();
+      const level = Math.min(6, headingMatch[1].length + 3);
+      chunks.push(`<h${level}>${renderInlineMarkdown(headingMatch[2].trim())}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (isBlockquoteLine(rawLine)) {
+      flushParagraph();
+      const quoteLines = [];
+      while (index < lines.length && isBlockquoteLine(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      chunks.push(`<blockquote>${quoteLines.map((line) => renderInlineMarkdown(line)).join("<br>")}</blockquote>`);
+      continue;
+    }
+
+    if (isUnorderedListLine(rawLine)) {
+      flushParagraph();
+      const items = [];
+      while (index < lines.length && isUnorderedListLine(lines[index])) {
+        items.push(lines[index].replace(/^\s*(?:[*+-])\s+/, ""));
+        index += 1;
+      }
+      chunks.push(`<ul>${items.map((line) => `<li>${renderInlineMarkdown(line)}</li>`).join("")}</ul>`);
+      continue;
+    }
+
+    if (isOrderedListLine(rawLine)) {
+      flushParagraph();
+      const items = [];
+      while (index < lines.length && isOrderedListLine(lines[index])) {
+        items.push(lines[index].replace(/^\s*\d+[.)]\s+/, ""));
+        index += 1;
+      }
+      chunks.push(`<ol>${items.map((line) => `<li>${renderInlineMarkdown(line)}</li>`).join("")}</ol>`);
+      continue;
+    }
+
+    paragraph.push(trimmed);
+    index += 1;
+  }
+
+  flushParagraph();
+  return chunks.join("");
+}
+
+function isBlockquoteLine(line) {
+  return /^\s*>\s?/.test(line);
+}
+
+function isUnorderedListLine(line) {
+  return /^\s*(?:[*+-])\s+/.test(line);
+}
+
+function isOrderedListLine(line) {
+  return /^\s*\d+[.)]\s+/.test(line);
+}
+
+function renderInlineMarkdown(text) {
+  let safe = escapeHtml(text ?? "");
+  const codeTokens = [];
+
+  safe = safe.replace(/`([^`]+)`/g, (_, code) => {
+    const token = `%%CODE_TOKEN_${codeTokens.length}%%`;
+    codeTokens.push(`<code>${code}</code>`);
+    return token;
+  });
+
+  safe = safe.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => (
+    `<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`
+  ));
+  safe = safe.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  safe = safe.replace(/(^|[^*])\*([^*\n]+)\*/g, (_, prefix, value) => `${prefix}<em>${value}</em>`);
+  safe = safe.replace(/(^|[^_])_([^_\n]+)_/g, (_, prefix, value) => `${prefix}<em>${value}</em>`);
+
+  for (let index = 0; index < codeTokens.length; index += 1) {
+    const token = `%%CODE_TOKEN_${index}%%`;
+    safe = safe.split(token).join(codeTokens[index]);
+  }
+
+  return safe;
+}
+
+function mergeDatasetIntoList(dataset) {
+  const byId = new Map(state.datasets.map((item) => [item.id, item]));
+  byId.set(dataset.id, dataset);
+  return Array.from(byId.values());
+}
+
+function syncAuthInputs() {
+  if (elements.apiKeyInput) {
+    elements.apiKeyInput.value = ensureApiKey();
+  }
+  if (elements.actorUserIdInput) {
+    elements.actorUserIdInput.value = ensureUserId();
+  }
+}
+
+function saveAuthInputs() {
+  if (!elements.apiKeyInput || !elements.actorUserIdInput) {
+    return;
+  }
+  const apiKey = (elements.apiKeyInput.value || "").trim();
+  const userId = (elements.actorUserIdInput.value || "").trim() || `web-${generateId()}`;
+  window.localStorage.setItem(STORAGE_KEYS.apiKey, apiKey);
+  window.localStorage.setItem(STORAGE_KEYS.userId, userId);
+  elements.actorUserIdInput.value = userId;
+  setAuthStatus(apiKey ? "Acceso guardado." : "Captura la API key para continuar.", apiKey ? "success" : "warn");
+}
+
+function ensureApiKey() {
+  return (window.localStorage.getItem(STORAGE_KEYS.apiKey) || "").trim();
+}
+
 function ensureUserId() {
   let userId = window.localStorage.getItem(STORAGE_KEYS.userId);
   if (!userId) {
@@ -529,6 +876,171 @@ function ensureUserId() {
     window.localStorage.setItem(STORAGE_KEYS.userId, userId);
   }
   return userId;
+}
+
+function getSessionToken() {
+  return (window.sessionStorage.getItem(STORAGE_KEYS.sessionToken) || "").trim();
+}
+
+function getSessionUserId() {
+  return (window.sessionStorage.getItem(STORAGE_KEYS.sessionUserId) || "").trim();
+}
+
+function hasStoredTokenSession() {
+  return Boolean(getSessionToken() && getSessionUserId());
+}
+
+function currentUserId() {
+  return isTokenMode() ? getSessionUserId() : ensureUserId();
+}
+
+function isTokenMode() {
+  return Boolean(state.mode === "token" && getSessionToken() && getSessionUserId());
+}
+
+function hasApiAccess() {
+  return Boolean(ensureApiKey() && ensureUserId());
+}
+
+function ensureApiAccess() {
+  if (!hasApiAccess()) {
+    throw new Error("Captura la API key y el user id para usar esta pantalla.");
+  }
+}
+
+function updateAccessVisibility() {
+  if (!elements.authCard) {
+    return;
+  }
+  elements.authCard.hidden = true;
+  elements.authCard.style.display = "none";
+}
+
+function buildApiHeaders(extraHeaders = {}) {
+  ensureApiAccess();
+  return {
+    "X-API-Key": ensureApiKey(),
+    "X-User-Id": ensureUserId(),
+    ...extraHeaders,
+  };
+}
+
+function buildSessionHeaders(extraHeaders = {}) {
+  const sessionToken = getSessionToken();
+  const sessionUserId = getSessionUserId();
+  if (!sessionToken || !sessionUserId) {
+    throw new Error("La sesion temporal ya no esta disponible.");
+  }
+  return {
+    "X-Session-Token": sessionToken,
+    "X-User-Id": sessionUserId,
+    ...extraHeaders,
+  };
+}
+
+function captureTokenModeFromUrl() {
+  const url = new URL(window.location.href);
+  const sessionToken = (url.searchParams.get("session_token") || "").trim();
+  const userId = (url.searchParams.get("user_id") || "").trim();
+  if (!sessionToken) {
+    return;
+  }
+
+  window.sessionStorage.setItem(STORAGE_KEYS.sessionToken, sessionToken);
+  if (userId) {
+    window.sessionStorage.setItem(STORAGE_KEYS.sessionUserId, userId);
+  } else {
+    window.sessionStorage.removeItem(STORAGE_KEYS.sessionUserId);
+  }
+
+  url.searchParams.delete("session_token");
+  url.searchParams.delete("user_id");
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  window.history.replaceState({}, "", nextUrl);
+}
+
+function clearTokenSession() {
+  stopHeartbeat();
+  window.sessionStorage.removeItem(STORAGE_KEYS.sessionToken);
+  window.sessionStorage.removeItem(STORAGE_KEYS.sessionUserId);
+}
+
+function buildChatMessageRequest(question, history) {
+  if (isTokenMode()) {
+    return {
+      url: "/chat/message",
+      headers: buildSessionHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ question, history }),
+    };
+  }
+
+  ensureApiAccess();
+  return {
+    url: "/query",
+    headers: buildApiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      dataset_id: state.activeDataset.id,
+      question,
+      history,
+    }),
+  };
+}
+
+function startHeartbeat() {
+  if (!isTokenMode()) {
+    return;
+  }
+  stopHeartbeat();
+  state.heartbeatTimer = window.setInterval(async () => {
+    try {
+      const response = await fetch("/chat/heartbeat", {
+        method: "POST",
+        headers: buildSessionHeaders(),
+      });
+      if (response.status === 401 || response.status === 403) {
+        clearTokenSession();
+        setAuthStatus("La sesion temporal expiro. Reabre el chat desde Visual FoxPro.", "error");
+        bootstrap();
+        return;
+      }
+    } catch (_) {}
+  }, 30000);
+}
+
+function stopHeartbeat() {
+  if (state.heartbeatTimer) {
+    window.clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+}
+
+async function handleTokenLogout() {
+  if (!isTokenMode()) {
+    return;
+  }
+
+  try {
+    await fetch("/chat/logout", {
+      method: "POST",
+      headers: buildSessionHeaders(),
+    });
+  } catch (_) {}
+
+  clearTokenSession();
+  state.mode = "session";
+  setAuthStatus("Sesion temporal cerrada. Reabre el chat desde Visual FoxPro.", "warn");
+  bootstrap();
+}
+
+function setAuthStatus(text, tone = "") {
+  if (elements.authStatusText) {
+    elements.authStatusText.textContent = text;
+    elements.authStatusText.className = tone ? `status-text ${tone}` : "status-text";
+  }
+  if (elements.sessionStageText) {
+    elements.sessionStageText.textContent = text;
+    elements.sessionStageText.className = tone ? `status-text ${tone}` : "status-text";
+  }
 }
 
 function labelForRole(role, subtitle) {
@@ -579,9 +1091,7 @@ function renderChart(chart) {
     case "scatter": return renderScatterChart(chart);
     default: return renderBarChart(chart);
   }
-}
-
-function renderBarChart(chart) {
+}function renderBarChart(chart) {
   const width = 680;
   const height = 300;
   const margin = { top: 20, right: 20, bottom: 64, left: 52 };
@@ -898,3 +1408,4 @@ function escapeHtml(value) {
 function escapeAttr(value) {
   return String(value).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
+

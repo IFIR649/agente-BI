@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Auditoria Ejecutiva del Agente</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Metricas / Auditoria Ejecutiva</p>
+          <h1>Panel de auditoria para decisiones de negocio</h1>
+          <p class="hero-text">
+            Revisa demanda, costo, velocidad de respuesta y calidad operativa del agente en una sola vista.
+            Esta pantalla consulta el historial real del backend y lo organiza para lectura ejecutiva.
+          </p>
+          <div class="hero-tags">
+            <span class="hero-tag">Resumen financiero</span>
+            <span class="hero-tag">Riesgo operativo</span>
+            <span class="hero-tag">Bitacora exportable</span>
+          </div>
+        </div>
+
+        <div class="hero-card">
+          <p class="eyebrow">Salud operativa</p>
+          <div class="hero-score-row">
+            <strong class="hero-score" id="hero-health-score">--</strong>
+            <span class="hero-score-label" id="hero-health-label">Pendiente</span>
+          </div>
+          <p class="hero-card-text" id="hero-health-copy">
+            Guarda el acceso y consulta las metricas para obtener una lectura del periodo.
+          </p>
+          <div class="hero-mini-grid">
+            <div class="hero-mini-card">
+              <span class="mini-label">Periodo</span>
+              <strong id="hero-period-text">Sin definir</strong>
+            </div>
+            <div class="hero-mini-card">
+              <span class="mini-label">Costo total</span>
+              <strong id="hero-cost-text">$0.00</strong>
+            </div>
+            <div class="hero-mini-card">
+              <span class="mini-label">Consultas</span>
+              <strong id="hero-query-text">0</strong>
+            </div>
+            <div class="hero-mini-card">
+              <span class="mini-label">Error rate</span>
+              <strong id="hero-error-text">0%</strong>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel command-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Acceso</p>
+            <h2>Conexion al backend</h2>
+          </div>
+          <p class="panel-copy">
+            Usa la API protegida con tu <strong>API key</strong> y un <strong>User ID</strong> para consultar auditoria.
+          </p>
+        </div>
+
+        <div class="command-grid">
+          <label class="field">
+            <span>API base</span>
+            <input id="api-base-input" type="text" placeholder="http://127.0.0.1:8000" />
+          </label>
+
+          <label class="field">
+            <span>API key</span>
+            <input id="api-key-input" type="password" placeholder="Clave global" />
+          </label>
+
+          <label class="field">
+            <span>User ID</span>
+            <input id="actor-user-id-input" type="text" placeholder="Ej. auditoria-negocio" />
+          </label>
+
+          <div class="action-stack">
+            <button class="primary-button" id="auth-save" type="button">Guardar acceso</button>
+            <button class="ghost-button" id="refresh-dashboard" type="button">Actualizar panel</button>
+          </div>
+        </div>
+
+        <div class="status-row">
+          <p class="status-text" id="auth-status-text">Captura API base, API key y User ID para comenzar.</p>
+          <p class="status-text" id="dashboard-status-text">Sin datos cargados.</p>
+        </div>
+      </section>
+
+      <section class="panel filter-panel">
+        <div class="panel-head compact">
+          <div>
+            <p class="eyebrow">Filtro ejecutivo</p>
+            <h2>Recorta el periodo y el foco de analisis</h2>
+          </div>
+          <div class="filter-actions">
+            <span class="dataset-chip" id="selected-dataset-chip">Todos los datasets</span>
+            <button class="ghost-button" id="reset-filters" type="button">Limpiar filtros</button>
+          </div>
+        </div>
+
+        <form class="filter-grid" id="filter-form">
+          <label class="field">
+            <span>Dataset</span>
+            <select id="filter-dataset">
+              <option value="">Todos los datasets</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Status</span>
+            <select id="filter-status">
+              <option value="">Todos</option>
+              <option value="ok">ok</option>
+              <option value="assistant_message">assistant_message</option>
+              <option value="needs_clarification">needs_clarification</option>
+              <option value="validation_error">validation_error</option>
+              <option value="rate_limited">rate_limited</option>
+              <option value="gemini_error">gemini_error</option>
+              <option value="gemini_unavailable">gemini_unavailable</option>
+              <option value="not_found">not_found</option>
+              <option value="error">error</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Cache</span>
+            <select id="filter-cache-hit">
+              <option value="">Todos</option>
+              <option value="false">fresh</option>
+              <option value="true">cache</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Desde</span>
+            <input id="filter-from" type="datetime-local" />
+          </label>
+
+          <label class="field">
+            <span>Hasta</span>
+            <input id="filter-to" type="datetime-local" />
+          </label>
+
+          <label class="field">
+            <span>User ID analizado</span>
+            <input id="filter-user-id" type="text" placeholder="Todos los usuarios" />
+          </label>
+        </form>
+      </section>
+
+      <section class="kpi-grid" id="kpi-grid"></section>
+
+      <section class="insight-grid">
+        <article class="panel spotlight-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Lectura ejecutiva</p>
+              <h2>Lo mas importante del periodo</h2>
+            </div>
+          </div>
+          <div id="executive-story"></div>
+        </article>
+
+        <article class="panel spotlight-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Alertas y oportunidades</p>
+              <h2>Senales para seguimiento</h2>
+            </div>
+          </div>
+          <div class="focus-list" id="focus-list"></div>
+        </article>
+      </section>
+
+      <section class="chart-grid">
+        <article class="panel chart-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Tendencia</p>
+              <h2>Costo diario y volumen</h2>
+            </div>
+            <p class="panel-copy">Barras por costo del dia y linea por numero de consultas.</p>
+          </div>
+          <div id="trend-chart"></div>
+        </article>
+
+        <article class="panel chart-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Estructura de costo</p>
+              <h2>Donde se esta yendo el dinero</h2>
+            </div>
+            <p class="panel-copy">Composicion del gasto estimado del periodo en pesos mexicanos.</p>
+          </div>
+          <div id="cost-mix"></div>
+        </article>
+      </section>
+
+      <section class="rank-grid">
+        <article class="panel rank-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Actividad reciente</p>
+              <h2>Usuarios mas activos</h2>
+            </div>
+            <p class="panel-copy">Ranking construido con los registros recientes cargados.</p>
+          </div>
+          <div id="top-users"></div>
+        </article>
+
+        <article class="panel rank-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Actividad reciente</p>
+              <h2>Datasets con mayor uso</h2>
+            </div>
+            <p class="panel-copy">Ayuda a identificar que fuentes concentran la demanda.</p>
+          </div>
+          <div id="top-datasets"></div>
+        </article>
+      </section>
+
+      <section class="breakdown-grid">
+        <article class="panel breakdown-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Distribucion</p>
+              <h2>Por status</h2>
+            </div>
+          </div>
+          <div id="breakdown-status"></div>
+        </article>
+
+        <article class="panel breakdown-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Distribucion</p>
+              <h2>Por modelo</h2>
+            </div>
+          </div>
+          <div id="breakdown-model"></div>
+        </article>
+
+        <article class="panel breakdown-panel">
+          <div class="panel-head compact">
+            <div>
+              <p class="eyebrow">Distribucion</p>
+              <h2>Por etapa</h2>
+            </div>
+          </div>
+          <div id="breakdown-stage"></div>
+        </article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Bitacora</p>
+            <h2>Consultas auditadas</h2>
+          </div>
+          <div class="table-actions">
+            <button class="ghost-button" id="export-csv" type="button">Exportar CSV</button>
+            <button class="ghost-button" id="export-json" type="button">Exportar JSON</button>
+          </div>
+        </div>
+
+        <div class="pagination-row">
+          <div class="status-text" id="pagination-text">0 resultados</div>
+          <div class="pagination-actions">
+            <button class="ghost-button" id="page-prev" type="button">Anterior</button>
+            <button class="ghost-button" id="page-next" type="button">Siguiente</button>
+          </div>
+        </div>
+
+        <div id="audit-table"></div>
+      </section>
+    </div>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>

@@ -95,6 +95,9 @@ class AuditLogger:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_timestamp ON query_audit(timestamp)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_dataset_id ON query_audit(dataset_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_user_id ON query_audit(user_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_session_token ON query_audit(session_token)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_client_id ON query_audit(client_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_app_session_id ON query_audit(app_session_id)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_query_audit_status ON query_audit(status)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_query_llm_calls_query_id ON query_llm_calls(query_id)")
 
@@ -108,6 +111,12 @@ class AuditLogger:
         status: str,
         validation_passed: bool,
         telemetry: QueryTelemetry,
+        principal_id: int | None = None,
+        api_key_id: int | None = None,
+        actor_user_name: str | None = None,
+        client_id: str | None = None,
+        app_session_id: str | None = None,
+        session_token: str | None = None,
         intent_parsed: dict[str, Any] | None = None,
         columns_used: list[str] | None = None,
         execution_ms: int | None = None,
@@ -119,6 +128,12 @@ class AuditLogger:
             query_id,
             datetime.now(timezone.utc).isoformat(),
             user_id,
+            principal_id,
+            api_key_id,
+            actor_user_name,
+            client_id,
+            app_session_id,
+            session_token,
             dataset_id,
             question,
             status,
@@ -191,6 +206,12 @@ class AuditLogger:
                         query_id,
                         timestamp,
                         user_id,
+                        principal_id,
+                        api_key_id,
+                        actor_user_name,
+                        client_id,
+                        app_session_id,
+                        session_token,
                         dataset_id,
                         question,
                         status,
@@ -221,7 +242,7 @@ class AuditLogger:
                         usd_to_mxn_rate,
                         fx_date,
                         fx_source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     payload,
                 )
@@ -268,6 +289,9 @@ class AuditLogger:
         *,
         dataset_id: str | None = None,
         user_id: str | None = None,
+        session_token: str | None = None,
+        client_id: str | None = None,
+        app_session_id: str | None = None,
         status: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
@@ -278,6 +302,9 @@ class AuditLogger:
         where_sql, params = self._build_filters(
             dataset_id=dataset_id,
             user_id=user_id,
+            session_token=session_token,
+            client_id=client_id,
+            app_session_id=app_session_id,
             status=status,
             date_from=date_from,
             date_to=date_to,
@@ -291,6 +318,12 @@ class AuditLogger:
                     query_id,
                     timestamp,
                     user_id,
+                    principal_id,
+                    api_key_id,
+                    actor_user_name,
+                    client_id,
+                    app_session_id,
+                    session_token,
                     dataset_id,
                     question,
                     status,
@@ -318,6 +351,9 @@ class AuditLogger:
         *,
         dataset_id: str | None = None,
         user_id: str | None = None,
+        session_token: str | None = None,
+        client_id: str | None = None,
+        app_session_id: str | None = None,
         status: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
@@ -326,6 +362,9 @@ class AuditLogger:
         records, _ = self.list_queries(
             dataset_id=dataset_id,
             user_id=user_id,
+            session_token=session_token,
+            client_id=client_id,
+            app_session_id=app_session_id,
             status=status,
             date_from=date_from,
             date_to=date_to,
@@ -422,6 +461,9 @@ class AuditLogger:
         *,
         dataset_id: str | None = None,
         user_id: str | None = None,
+        session_token: str | None = None,
+        client_id: str | None = None,
+        app_session_id: str | None = None,
         status: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
@@ -430,6 +472,9 @@ class AuditLogger:
         records, _ = self.list_queries(
             dataset_id=dataset_id,
             user_id=user_id,
+            session_token=session_token,
+            client_id=client_id,
+            app_session_id=app_session_id,
             status=status,
             date_from=date_from,
             date_to=date_to,
@@ -487,6 +532,9 @@ class AuditLogger:
         *,
         dataset_id: str | None,
         user_id: str | None,
+        session_token: str | None,
+        client_id: str | None,
+        app_session_id: str | None,
         status: str | None,
         date_from: datetime | None,
         date_to: datetime | None,
@@ -500,6 +548,15 @@ class AuditLogger:
         if user_id:
             conditions.append("user_id = ?")
             params.append(user_id)
+        if session_token:
+            conditions.append("session_token = ?")
+            params.append(session_token)
+        if client_id:
+            conditions.append("client_id = ?")
+            params.append(client_id)
+        if app_session_id:
+            conditions.append("app_session_id = ?")
+            params.append(app_session_id)
         if status:
             conditions.append("status = ?")
             params.append(status)
@@ -609,6 +666,12 @@ class AuditLogger:
             query_id=query_id,
             timestamp=timestamp,
             user_id=row["user_id"],
+            principal_id=row["principal_id"],
+            api_key_id=row["api_key_id"],
+            actor_user_name=row["actor_user_name"],
+            client_id=row["client_id"],
+            app_session_id=row["app_session_id"],
+            session_token=row["session_token"],
             dataset_id=row["dataset_id"],
             question=row["question"],
             status=row["status"],
@@ -627,6 +690,12 @@ class AuditLogger:
 
 _QUERY_AUDIT_COLUMNS = {
     "query_id": "TEXT",
+    "principal_id": "INTEGER",
+    "api_key_id": "INTEGER",
+    "actor_user_name": "TEXT",
+    "client_id": "TEXT",
+    "app_session_id": "TEXT",
+    "session_token": "TEXT",
     "cache_hit": "INTEGER NOT NULL DEFAULT 0",
     "total_latency_ms": "INTEGER",
     "stages": "TEXT",

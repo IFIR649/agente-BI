@@ -14,7 +14,7 @@ from backend.app.core.gemini_client import (
     GeminiUnavailableError,
 )
 from backend.app.core.telemetry import QueryTelemetryCollector
-from backend.app.core.utils import humanize_identifier, normalize_text, normalize_weekday_name
+from backend.app.core.utils import humanize_identifier, jsonable_value, normalize_text, normalize_weekday_name
 from backend.app.models.dataset import DatasetCatalog
 from backend.app.models.intent import AgentDecision, ConversationTurn, QueryFilter, QueryPlan, SortSpec, StructuredAgentDecision
 from backend.app.models.telemetry import LLMCallTelemetry
@@ -29,6 +29,7 @@ class IntentParser:
         self.settings = settings
         self.gemini_client = gemini_client
         self._cached_contents: dict[str, str] = {}
+        self._cached_content_expires_at: dict[str, datetime] = {}
         self._cache_failure_until: dict[str, datetime] = {}
 
     def parse(
@@ -325,33 +326,93 @@ class IntentParser:
         temperature: float,
     ):
         cache_key = self._context_cache_key(catalog=catalog, model=model)
-        cached_content_name = self._cached_contents.get(cache_key)
+        cached_content_name = self._get_cached_content_name(cache_key)
 
         if cached_content_name is None and not self._cache_failure_is_active(cache_key):
-            try:
-                cached_content_name = self.gemini_client.create_cached_content(
-                    system_instruction=system_instruction,
-                    model=model,
-                    ttl_hours=self.settings.gemini_context_cache_ttl_hours,
-                )
-                self._cached_contents[cache_key] = cached_content_name
-            except GeminiClientError:
-                self._cache_failure_until[cache_key] = datetime.now() + timedelta(
-                    seconds=self.settings.gemini_context_cache_failure_cooldown_seconds
-                )
-                cached_content_name = None
+            cached_content_name = self._create_context_cache(
+                cache_key=cache_key,
+                system_instruction=system_instruction,
+                model=model,
+            )
 
-        return self.gemini_client.generate_structured_result(
-            system_instruction=system_instruction,
-            prompt=prompt,
-            response_model=response_model,
-            model=model,
-            temperature=temperature,
-            cached_content_name=cached_content_name,
-        )
+        try:
+            return self.gemini_client.generate_structured_result(
+                system_instruction=system_instruction,
+                prompt=prompt,
+                response_model=response_model,
+                model=model,
+                temperature=temperature,
+                cached_content_name=cached_content_name,
+            )
+        except GeminiClientError as exc:
+            if not cached_content_name or not self._is_missing_cached_content_error(exc):
+                raise
+
+            logger.warning("model=%s status=cache_invalidated reason=%s", model, exc)
+            self._invalidate_context_cache(cache_key)
+            retry_cached_content = self._create_context_cache(
+                cache_key=cache_key,
+                system_instruction=system_instruction,
+                model=model,
+            )
+            return self.gemini_client.generate_structured_result(
+                system_instruction=system_instruction,
+                prompt=prompt,
+                response_model=response_model,
+                model=model,
+                temperature=temperature,
+                cached_content_name=retry_cached_content,
+            )
 
     def _context_cache_key(self, *, catalog: DatasetCatalog, model: str) -> str:
         return f"{catalog.id}:{catalog.catalog_version}:{model}"
+
+    def _get_cached_content_name(self, cache_key: str) -> str | None:
+        cached_content_name = self._cached_contents.get(cache_key)
+        if cached_content_name is None:
+            return None
+
+        expires_at = self._cached_content_expires_at.get(cache_key)
+        if expires_at is not None and expires_at <= datetime.now():
+            self._invalidate_context_cache(cache_key)
+            return None
+
+        return cached_content_name
+
+    def _create_context_cache(self, *, cache_key: str, system_instruction: str, model: str) -> str | None:
+        if self._cache_failure_is_active(cache_key):
+            return None
+
+        try:
+            cached_content_name = self.gemini_client.create_cached_content(
+                system_instruction=system_instruction,
+                model=model,
+                ttl_hours=self.settings.gemini_context_cache_ttl_hours,
+            )
+        except GeminiClientError:
+            self._cache_failure_until[cache_key] = datetime.now() + timedelta(
+                seconds=self.settings.gemini_context_cache_failure_cooldown_seconds
+            )
+            return None
+
+        self._cached_contents[cache_key] = cached_content_name
+        ttl_seconds = max(60, int(self.settings.gemini_context_cache_ttl_hours * 3600))
+        safety_margin_seconds = min(300, max(30, ttl_seconds // 20))
+        self._cached_content_expires_at[cache_key] = datetime.now() + timedelta(
+            seconds=max(30, ttl_seconds - safety_margin_seconds)
+        )
+        self._cache_failure_until.pop(cache_key, None)
+        return cached_content_name
+
+    def _invalidate_context_cache(self, cache_key: str) -> None:
+        self._cached_contents.pop(cache_key, None)
+        self._cached_content_expires_at.pop(cache_key, None)
+
+    def _is_missing_cached_content_error(self, exc: GeminiClientError) -> bool:
+        reason = str(exc).lower()
+        if "cachedcontent" not in reason and "cached content" not in reason:
+            return False
+        return "not found" in reason or "permission denied" in reason or "permission_denied" in reason
 
     def _cache_failure_is_active(self, cache_key: str) -> bool:
         until = self._cache_failure_until.get(cache_key)
@@ -394,7 +455,7 @@ class IntentParser:
                 }
                 for metric in catalog.metrics_allowed
             ],
-            "sample_rows": catalog.sample_rows[:1],
+            "sample_rows": [self._jsonable_mapping(row) for row in catalog.sample_rows[:1]],
         }
 
         return (
@@ -431,9 +492,12 @@ class IntentParser:
             "semantic_role": column.semantic_role,
         }
         if column.semantic_role in {"time", "measure"}:
-            descriptor["min"] = column.min_value
-            descriptor["max"] = column.max_value
+            descriptor["min"] = jsonable_value(column.min_value)
+            descriptor["max"] = jsonable_value(column.max_value)
         return descriptor
+
+    def _jsonable_mapping(self, payload: dict[str, object]) -> dict[str, object]:
+        return {key: jsonable_value(value) for key, value in payload.items()}
 
     def _build_prompt(self, *, question: str, history: list[ConversationTurn], catalog: DatasetCatalog) -> str:
         if not history:

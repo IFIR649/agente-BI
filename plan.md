@@ -852,3 +852,257 @@ Esto requiere pasar `catalog` al summary writer (actualmente no lo recibe).
 
 ### Nota
 Despues de implementar P3.1, hay que **re-perfilar los datasets existentes** para que los nuevos labels se generen. Los catalogos guardados en JSON tendran los labels viejos hasta que se re-suban los CSVs.
+
+---
+
+## Parte 4: Tokens de acceso, flujo CSV directo y limpieza de sesion
+
+### Contexto
+
+El backend actual no tiene autenticacion real (usa `X-User-Id` header opcional), el usuario debe seleccionar dataset manualmente, y los CSVs quedan en disco indefinidamente. El sistema se desplegara en Windows Server y sera consumido via WebView2 dentro de una app FoxPro.
+
+Se necesita:
+1. Control de tokens de acceso para validar sesion
+2. Flujo CSV → chat directo (sin paso de seleccion de dataset)
+3. Destruccion automatica del CSV al cerrar conexion
+4. Optimizacion del flujo CSV → DuckDB
+
+---
+
+### Flujo final de la aplicacion
+
+```
+FoxPro App                          Backend API
+    |                                    |
+    |--- POST /sessions --------------->|  1. Crea sesion, devuelve token UUID
+    |<-- { token: "abc-123" } ----------|
+    |                                    |
+    |--- POST /sessions/abc-123/upload ->|  2. Sube CSV con el token
+    |    [archivo CSV]                   |     - Valida token
+    |                                    |     - Guarda CSV temporal
+    |                                    |     - Perfila (dataset_profiler)
+    |                                    |     - CREATE TABLE en DuckDB en memoria
+    |                                    |     - Asocia todo a la sesion
+    |<-- { dataset: DatasetSummary } ----|
+    |                                    |
+    |  (WebView2 carga chat UI)          |
+    |                                    |
+    |--- POST /sessions/abc-123/query -->|  3. Chat directo (sin seleccionar dataset)
+    |    { question, history }           |     - Token implica cual dataset usar
+    |                                    |     - Usa conexion DuckDB pre-cargada
+    |<-- { QuerySuccessResponse } ------|     - Intent -> Execute -> Summarize
+    |                                    |
+    |--- POST /sessions/abc-123/heartbeat ->|  4. Keep-alive cada 30s (JS)
+    |<-- { ok: true } ------------------|
+    |                                    |
+    |  (usuario cierra pestaña)          |
+    |    navigator.sendBeacon(logout)    |  5. O timeout de heartbeat (5 min)
+    |                                    |     - Cierra conexion DuckDB
+    |                                    |     - Elimina CSV de disco
+    |                                    |     - Elimina catalogo JSON
+    |                                    |     - Remueve sesion de memoria
+```
+
+---
+
+### P4.1 Diseño de endpoints
+
+#### `POST /sessions` — Crear sesion
+```
+Request:  (vacio o { "user_id": "foxpro-user" })
+Response: { "token": "550e8400-...", "expires_in": 300 }
+Status:   201
+Error:    503 si se alcanzo max_concurrent_sessions
+```
+
+#### `POST /sessions/{token}/upload` — Subir CSV
+```
+Request:  multipart/form-data (file + metadata opcional)
+Response: DatasetSummary (misma estructura actual)
+Status:   201
+Errors:   401 (token invalido), 400 (CSV invalido), 409 (ya tiene dataset)
+```
+
+#### `POST /sessions/{token}/query` — Consultar
+```
+Request:  { "question": "...", "history": [...] }
+          (SIN dataset_id — el token lo implica)
+Response: QuerySuccessResponse | ClarificationResponse | AssistantMessageResponse
+Errors:   401 (token invalido), 412 (no hay dataset subido aun)
+```
+
+#### `POST /sessions/{token}/heartbeat` — Keep-alive
+```
+Request:  (vacio)
+Response: { "ok": true, "expires_in": 300 }
+Errors:   401 (token expirado/invalido)
+```
+
+#### `DELETE /sessions/{token}` — Logout explicito
+```
+Request:  (vacio)
+Response: { "ok": true }
+Status:   200 (idempotente)
+```
+
+---
+
+### P4.2 Archivos a crear
+
+#### `backend/app/core/session.py` — Modelo y store de sesiones (~150 lineas)
+
+**`Session`** dataclass:
+- `token: str` (UUID)
+- `dataset_id: str | None`
+- `catalog: DatasetCatalog | None`
+- `csv_path: Path | None`
+- `duckdb_conn: duckdb.DuckDBPyConnection | None`
+- `created_at: float`
+- `last_heartbeat: float`
+- `user_id: str`
+- `lock: threading.Lock` — para thread-safety de la conexion DuckDB
+
+**`SessionStore`** clase:
+- `_sessions: dict[str, Session]` — en memoria, indexado por token
+- `_lock: threading.Lock` — para mutaciones del dict
+- `create_session(user_id) -> str` — genera UUID, almacena sesion vacia, retorna token
+- `attach_dataset(token, dataset_id, catalog, csv_path, duckdb_conn)` — se llama post-upload
+- `get_session(token) -> Session | None` — busqueda + validacion
+- `heartbeat(token) -> bool` — actualiza `last_heartbeat`
+- `destroy_session(token)` — cierra DuckDB, borra CSV, borra catalogo, remueve del dict
+- `cleanup_expired(timeout_seconds)` — destruye sesiones sin heartbeat reciente
+- `destroy_all()` — para shutdown del servidor
+
+**Registro en SQLite** (tabla `sessions` en `audit.db`): solo para recuperacion de archivos post-crash. No restaura sesiones (la conexion DuckDB se pierde al reiniciar), solo limpia archivos huerfanos al iniciar.
+
+#### `backend/app/routers/sessions.py` — Router de sesiones (~150 lineas)
+
+5 endpoints que delegan logica al `SessionStore` y servicios existentes (`dataset_profiler`, `intent_parser`, `query_executor`, `summary_writer`).
+
+---
+
+### P4.3 Archivos a modificar
+
+#### `backend/app/config.py`
+- `session_timeout_seconds: int = 300` (5 min de inactividad)
+- `session_cleanup_interval_seconds: int = 60`
+- `max_concurrent_sessions: int = 50`
+
+#### `backend/app/core/database.py`
+Agregar metodo `load_csv_into_table(connection, csv_path, table_name="dataset")`:
+```sql
+CREATE TABLE {table_name} AS
+SELECT * FROM read_csv_auto('{csv_path}', SAMPLE_SIZE=-1, HEADER=TRUE)
+```
+Lee el CSV **una sola vez** y lo almacena en formato columnar en memoria de DuckDB.
+
+#### `backend/app/services/query_executor.py`
+Agregar parametro `connection=None` a `execute()`:
+- Si `connection` viene (modo sesion): usar directamente, tabla `"dataset"`, sin re-leer CSV
+- Si no viene: comportamiento actual (crea sesion, registra vista desde CSV)
+- Adquirir `session.lock` antes de usar la conexion (DuckDB no es thread-safe)
+
+#### `backend/app/main.py`
+- Instanciar `SessionStore` y adjuntar a `app.state.session_store`
+- Incluir `sessions_router` con prefijo `/sessions`
+- Agregar lifespan con loop de limpieza en background + destroy_all en shutdown
+- Limpieza de sesiones huerfanas del crash anterior al iniciar
+
+---
+
+### P4.4 Optimizacion CSV → DuckDB
+
+#### Problema actual
+Cada `POST /query` ejecuta `CREATE OR REPLACE TEMP VIEW dataset_view AS SELECT * FROM read_csv_auto(...)`. Esto **re-lee y parsea el CSV completo** en cada consulta. Para un CSV de 50k filas, agrega cientos de milisegundos.
+
+#### Solucion: pre-carga en upload
+Al momento del upload (`POST /sessions/{token}/upload`):
+1. Crear conexion DuckDB persistente: `duckdb.connect(":memory:")`
+2. Ejecutar: `CREATE TABLE dataset AS SELECT * FROM read_csv_auto(...)`
+3. Crear indices en columnas de fecha detectadas por el profiler (patron del proyecto de referencia)
+4. Guardar conexion en `Session.duckdb_conn`
+
+Consultas posteriores usan la conexion existente — datos ya en formato columnar en memoria, sin I/O de disco. **Estimacion: 10-50x mas rapido** en queries analiticos.
+
+#### Memoria
+- Max upload: 25MB × 50 sesiones = ~1.25 GB peor caso
+- DuckDB comprime columnar: ~30-60% del CSV crudo
+- `max_concurrent_sessions` es el limitador
+
+---
+
+### P4.5 Deteccion de desconexion
+
+#### Cliente (WebView2/JS)
+```javascript
+// Heartbeat cada 30 segundos
+const heartbeatInterval = setInterval(async () => {
+    const resp = await fetch(`/sessions/${token}/heartbeat`, { method: 'POST' });
+    if (!resp.ok) { /* sesion expirada, redirigir */ }
+}, 30000);
+
+// Al cerrar pestaña: logout explicito via sendBeacon
+window.addEventListener('beforeunload', () => {
+    clearInterval(heartbeatInterval);
+    navigator.sendBeacon(`/sessions/${token}/logout`);
+});
+```
+
+#### Servidor (background cleanup)
+- Loop asyncio cada 60 segundos
+- Revisa `now - session.last_heartbeat > timeout_seconds`
+- Destruye sesiones expiradas (cierra DuckDB, borra archivos)
+- Peor caso: sesion muerta persiste ~6 min (5 min timeout + 1 min intervalo)
+
+#### Crash recovery
+- Al iniciar servidor, leer tabla `sessions` de SQLite
+- Para cada sesion stale: borrar CSV y catalogo del disco
+- Limpiar tabla
+
+---
+
+### P4.6 Decisiones de diseño
+
+| Decision | Justificacion |
+|----------|--------------|
+| **UUID en vez de JWT** | Servidor es proceso unico; no hay validacion cross-service. UUID es mas simple, sin claves de firma ni expiracion por claims. Session state vive en memoria. |
+| **Dict en memoria + SQLite backup** | La conexion DuckDB no se serializa. Dict da O(1) lookup sin serializacion. SQLite solo registra rutas para limpieza post-crash. |
+| **CREATE TABLE en vez de VIEW** | VIEW re-parsea CSV en cada query. TABLE lo lee una vez y queda en formato columnar. 10-50x mas rapido. |
+| **Token en URL path** | `navigator.sendBeacon()` no puede poner headers custom. URL path funciona con sendBeacon para logout al cerrar pestaña. |
+| **Lock por sesion** | DuckDB connections no son thread-safe. Lock por sesion permite queries concurrentes entre sesiones. |
+
+---
+
+### P4.7 Thread safety
+
+- `SessionStore._lock` protege mutaciones del diccionario de sesiones (crear, destruir)
+- `Session.lock` protege la conexion DuckDB individual (una query a la vez por sesion)
+- FastAPI ejecuta handlers async, pero `query_executor.execute` corre sync en thread pool — el lock de sesion es necesario
+
+---
+
+### P4.8 Compatibilidad hacia atras
+
+Los endpoints existentes (`/datasets/*`, `/query`) **no se tocan**. Siguen funcionando para desarrollo/testing. Los nuevos endpoints `/sessions/*` son el flujo produccion para FoxPro/WebView2.
+
+---
+
+### Orden de ejecucion Parte 4
+
+| # | Tarea | Archivo principal | Impacto |
+|---|-------|-------------------|---------|
+| 1 | P4.3a | config.py | Bajo — 3 campos nuevos |
+| 2 | P4.2a | core/session.py (nuevo) | ALTO — pieza central |
+| 3 | P4.3b | core/database.py | MEDIO — optimizacion DuckDB |
+| 4 | P4.3c | services/query_executor.py | MEDIO — queries pre-cargados |
+| 5 | P4.2b | routers/sessions.py (nuevo) | ALTO — todos los endpoints |
+| 6 | P4.3d | main.py | MEDIO — conecta todo |
+| 7 | P4.7 | tests/test_sessions.py (nuevo) | ALTO — validar lifecycle |
+
+### Verificacion
+
+1. **Unit test**: crear sesion → upload CSV → query → verificar respuesta → destroy → verificar que CSV fue borrado
+2. **Test de expiracion**: crear sesion → no enviar heartbeat → esperar timeout → verificar cleanup automatico
+3. **Test de concurrencia**: multiples sesiones activas, queries en paralelo
+4. **Test de crash recovery**: crear sesion → matar servidor → reiniciar → verificar que archivos huerfanos se limpiaron
+5. **Test manual con WebView2**: flujo completo desde FoxPro

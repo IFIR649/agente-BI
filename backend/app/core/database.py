@@ -55,6 +55,41 @@ class DuckDBManager:
             """
         )
 
+    def load_csv_into_table(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        csv_path: Path,
+        table_name: str = "dataset",
+    ) -> None:
+        """Lee el CSV una sola vez y lo almacena en tabla DuckDB en memoria.
+
+        A diferencia de register_csv_view (que re-parsea el CSV en cada query),
+        CREATE TABLE materializa los datos en formato columnar en memoria.
+        """
+        safe_path = quote_literal(str(csv_path))
+        connection.execute(
+            f"""
+            CREATE OR REPLACE TABLE {quote_identifier(table_name)} AS
+            SELECT * FROM read_csv_auto(
+                {safe_path},
+                SAMPLE_SIZE=-1,
+                HEADER=TRUE
+            )
+            """
+        )
+
+    def create_persistent_connection(self) -> duckdb.DuckDBPyConnection:
+        """Crea una conexion DuckDB de larga vida para usar en una sesion.
+
+        El llamador es responsable de cerrar la conexion al destruir la sesion.
+        """
+        connection = duckdb.connect(database=":memory:")
+        try:
+            connection.execute(f"SET statement_timeout='{self.settings.query_timeout_seconds}s'")
+        except duckdb.Error:
+            pass
+        return connection
+
     def ping(self) -> bool:
         with self.session() as connection:
             result = connection.execute("SELECT 1").fetchone()

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+
+os.environ.setdefault("AGENT_API_KEY", "test-api-key")
 
 from backend.app.config import Settings
 from backend.app.core.gemini_client import GeminiCallResult, GeminiClientError, GeminiResponseFormatError, GeminiUsageMetrics
@@ -132,6 +135,7 @@ def build_settings(tmp_path: Path, *, rate_limit_requests: int = 20) -> Settings
         audit_db_path=tmp_path / "logs" / "audit.db",
         rate_limit_requests=rate_limit_requests,
         rate_limit_window_seconds=60,
+        api_key="test-api-key",
         gemini_api_key="test-gemini-key",
         gemini_flash_model="gemini-2.5-flash",
         gemini_pro_model="gemini-2.5-flash",
@@ -172,6 +176,7 @@ def app(tmp_path: Path):
 @pytest.fixture
 def client(app):
     with TestClient(app) as test_client:
+        test_client.headers.update({"X-API-Key": "test-api-key", "X-User-Id": "test-user"})
         yield test_client
 
 

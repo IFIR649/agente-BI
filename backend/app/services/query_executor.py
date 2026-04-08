@@ -29,44 +29,71 @@ class QueryExecutor:
         self.settings = settings
         self.db_manager = db_manager
 
-    def execute(self, *, catalog: DatasetCatalog, plan: QueryPlan) -> QueryExecutionResult:
+    def execute(
+        self,
+        *,
+        catalog: DatasetCatalog,
+        plan: QueryPlan,
+        connection: object | None = None,
+        table_name: str = "dataset_view",
+    ) -> QueryExecutionResult:
+        """Ejecuta el plan de consulta.
+
+        Si se pasa `connection` (modo sesion), usa esa conexion pre-cargada
+        y la tabla `table_name` (default "dataset_view"; para sesiones usar "dataset").
+        Si no se pasa, abre una conexion nueva y registra la vista CSV.
+        """
         logger.info(
-            "execute dataset=%s intent=%s metrics=%s dimensions=%s",
-            catalog.id, plan.intent, plan.metrics, plan.dimensions,
+            "execute dataset=%s intent=%s metrics=%s dimensions=%s session=%s",
+            catalog.id, plan.intent, plan.metrics, plan.dimensions, connection is not None,
         )
+
+        if connection is not None:
+            return self._run_queries(connection, catalog=catalog, plan=plan, table_name=table_name)
+
         csv_path = catalog.resolve_csv_path(data_dir=self.settings.data_dir)
         if csv_path is None:
             raise FileNotFoundError(f"No se encontro el archivo del dataset {catalog.id}.")
 
-        with self.db_manager.session() as connection:
-            self.db_manager.register_csv_view(connection, csv_path)
+        with self.db_manager.session() as conn:
+            self.db_manager.register_csv_view(conn, csv_path)
+            return self._run_queries(conn, catalog=catalog, plan=plan, table_name="dataset_view")
 
-            rows = self._execute_main_query(connection, catalog=catalog, plan=plan)
-            current_totals = self._execute_totals_query(connection, catalog=catalog, filters=plan.filters, metrics=plan.metrics)
+    def _run_queries(
+        self,
+        connection: object,
+        *,
+        catalog: DatasetCatalog,
+        plan: QueryPlan,
+        table_name: str,
+    ) -> QueryExecutionResult:
+        rows = self._execute_main_query(connection, catalog=catalog, plan=plan, table_name=table_name)
+        current_totals = self._execute_totals_query(connection, catalog=catalog, filters=plan.filters, metrics=plan.metrics, table_name=table_name)
 
-            previous_totals = None
-            comparison_applied = False
-            if plan.comparison == "previous_period":
-                previous_filters = self._build_previous_period_filters(plan.filters, catalog)
-                if previous_filters is not None:
-                    previous_totals = self._execute_totals_query(
-                        connection,
-                        catalog=catalog,
-                        filters=previous_filters,
-                        metrics=plan.metrics,
-                    )
-                    comparison_applied = True
+        previous_totals = None
+        comparison_applied = False
+        if plan.comparison == "previous_period":
+            previous_filters = self._build_previous_period_filters(plan.filters, catalog)
+            if previous_filters is not None:
+                previous_totals = self._execute_totals_query(
+                    connection,
+                    catalog=catalog,
+                    filters=previous_filters,
+                    metrics=plan.metrics,
+                    table_name=table_name,
+                )
+                comparison_applied = True
 
-            columns = list(rows[0].keys()) if rows else list(plan.dimensions + plan.metrics)
-            return QueryExecutionResult(
-                columns=columns,
-                rows=rows,
-                current_totals=current_totals,
-                previous_totals=previous_totals,
-                comparison_applied=comparison_applied,
-            )
+        columns = list(rows[0].keys()) if rows else list(plan.dimensions + plan.metrics)
+        return QueryExecutionResult(
+            columns=columns,
+            rows=rows,
+            current_totals=current_totals,
+            previous_totals=previous_totals,
+            comparison_applied=comparison_applied,
+        )
 
-    def _execute_main_query(self, connection, *, catalog: DatasetCatalog, plan: QueryPlan) -> list[dict[str, Any]]:
+    def _execute_main_query(self, connection, *, catalog: DatasetCatalog, plan: QueryPlan, table_name: str = "dataset_view") -> list[dict[str, Any]]:
         select_clauses: list[str] = []
         group_by_clauses: list[str] = []
 
@@ -94,7 +121,7 @@ class QueryExecutor:
 
         sql = f"""
             SELECT {', '.join(select_clauses)}
-            FROM dataset_view
+            FROM {quote_identifier(table_name)}
             {where_sql}
             {group_by_sql}
             {order_by_sql}
@@ -107,7 +134,7 @@ class QueryExecutor:
             for row in cursor.fetchall()
         ]
 
-    def _execute_totals_query(self, connection, *, catalog: DatasetCatalog, filters: list[QueryFilter], metrics: list[str]) -> dict[str, Any]:
+    def _execute_totals_query(self, connection, *, catalog: DatasetCatalog, filters: list[QueryFilter], metrics: list[str], table_name: str = "dataset_view") -> dict[str, Any]:
         select_clauses = [
             f"{catalog.metrics_index[metric_name].formula} AS {quote_identifier(metric_name)}"
             for metric_name in metrics
@@ -115,7 +142,7 @@ class QueryExecutor:
         where_sql, params = self._build_where_clause(filters, catalog)
         sql = f"""
             SELECT {', '.join(select_clauses)}
-            FROM dataset_view
+            FROM {quote_identifier(table_name)}
             {where_sql}
         """
         cursor = connection.execute(sql, params)

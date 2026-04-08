@@ -106,6 +106,12 @@ class QueryAuditRecord(BaseModel):
     query_id: str
     timestamp: datetime
     user_id: str
+    principal_id: int | None = None
+    api_key_id: int | None = None
+    actor_user_name: str | None = None
+    client_id: str | None = None
+    app_session_id: str | None = None
+    session_token: str | None = None
     dataset_id: str
     question: str
     status: str

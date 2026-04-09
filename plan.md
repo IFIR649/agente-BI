@@ -1031,8 +1031,6 @@ Consultas posteriores usan la conexion existente — datos ya en formato columna
 
 ---
 
-### P4.5 Deteccion de desconexion
-
 #### Cliente (WebView2/JS)
 ```javascript
 // Heartbeat cada 30 segundos

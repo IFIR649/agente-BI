@@ -4,14 +4,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+```bash
+# Backend on Ubuntu / Linux (development — uses --reload)
+bash scripts/backend-dev.sh --host 0.0.0.0 --port 8000
+
+# Backend on Ubuntu / Linux (production — no --reload, no access log)
+bash scripts/backend-prod.sh --host 0.0.0.0 --port 8000
+
+# Backend tests on Ubuntu / Linux
+bash scripts/backend-test.sh
+```
+
 ```powershell
-# Backend (development — uses --reload, do NOT use on Windows Server)
+# Backend on Windows (development — uses --reload, do NOT use on Windows Server)
 .\scripts\backend-dev.ps1
 
-# Backend (production — no --reload, no access log)
+# Backend on Windows (production — no --reload, no access log)
 .\scripts\backend-prod.ps1 --host 0.0.0.0 --port 8000
 
-# Backend tests (all)
+# Backend tests on Windows (all)
 .\scripts\backend-test.ps1
 
 # Run a single test file or test
@@ -19,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 .\scripts\backend-test.ps1 backend\tests\test_api.py -k "test_query"
 ```
 
-Backend commands must run through the repo-local interpreter at `.\env\Scripts\python.exe`.
+Backend commands should prefer the repo-local interpreter. On Linux the shell scripts detect: active virtualenv, `./env/bin/python`, `./.venv/bin/python`, `./venv/bin/python`, then `python3`. On Windows the PowerShell scripts require `.\env\Scripts\python.exe`.
 
 > **Windows Server tip:** If the API appears frozen in an interactive console, check for QuickEdit/Selection mode — it pauses the process until selection is cleared.
 

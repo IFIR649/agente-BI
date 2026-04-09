@@ -54,3 +54,4 @@ Los scripts PowerShell siguen requiriendo el entorno local del repo en `.\env\Sc
 `backend-prod.ps1` inicia Uvicorn sin `--reload` y con `--no-access-log` para evitar flujo ruidoso por request en consola. Se conservan los logs de arranque y error.
 
 Si la API parece "congelada" en una consola interactiva de Windows, revisa antes si la ventana entro en modo seleccion o QuickEdit. Ese estado puede pausar el proceso y simular un cuelgue hasta salir de la seleccion.
+# chat-web

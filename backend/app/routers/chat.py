@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip as _gzip
 import json
 import logging
 import time
@@ -118,6 +119,7 @@ async def _bootstrap_session_upload(
 ) -> tuple[str, DatasetSummary]:
     settings = request.app.state.settings
     store = request.app.state.session_store
+    profile_started = time.perf_counter()
 
     if store.active_count() >= settings.max_concurrent_sessions:
         raise HTTPException(
@@ -133,6 +135,12 @@ async def _bootstrap_session_upload(
     if not content:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El archivo esta vacio.")
 
+    if content[:2] == b'\x1f\x8b':
+        try:
+            content = _gzip.decompress(content)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"No se pudo descomprimir el archivo: {exc}") from exc
+
     max_size_bytes = settings.max_upload_size_mb * 1024 * 1024
     if len(content) > max_size_bytes:
         raise HTTPException(
@@ -147,23 +155,23 @@ async def _bootstrap_session_upload(
         except Exception as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="metadata no es un JSON valido.") from exc
 
-    token = store.create_session(auth)
-
     try:
         catalog = await asyncio.to_thread(
             request.app.state.dataset_profiler.profile_and_store,
             filename=filename,
             content=content,
             metadata=parsed_metadata,
+            generate_labels=False,
         )
     except Exception:
-        request.app.state.session_store.destroy_session(token)
         raise
+    profile_elapsed_ms = int((time.perf_counter() - profile_started) * 1000)
 
     csv_path = settings.uploads_dir / f"{catalog.id}.csv"
     catalog_path = settings.catalogs_dir / f"{catalog.id}.json"
     db_manager = request.app.state.db_manager
     duckdb_conn = db_manager.create_persistent_connection()
+    load_started = time.perf_counter()
 
     try:
         await asyncio.to_thread(
@@ -176,8 +184,10 @@ async def _bootstrap_session_upload(
         duckdb_conn.close()
         csv_path.unlink(missing_ok=True)
         catalog_path.unlink(missing_ok=True)
-        request.app.state.session_store.destroy_session(token)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error al cargar CSV en DuckDB: {exc}") from exc
+    load_elapsed_ms = int((time.perf_counter() - load_started) * 1000)
+
+    token = store.create_session(auth)
 
     attached = request.app.state.session_store.attach_dataset(
         token,
@@ -194,7 +204,14 @@ async def _bootstrap_session_upload(
         request.app.state.session_store.destroy_session(token)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo asociar el dataset a la sesion.")
 
-    logger.info("chat bootstrap token=%s dataset=%s user=%s", token, catalog.id, auth.actor_user_id)
+    logger.info(
+        "chat bootstrap token=%s dataset=%s user=%s profile_ms=%s load_ms=%s labels=disabled",
+        token,
+        catalog.id,
+        auth.actor_user_id,
+        profile_elapsed_ms,
+        load_elapsed_ms,
+    )
     return token, catalog.to_summary()
 
 

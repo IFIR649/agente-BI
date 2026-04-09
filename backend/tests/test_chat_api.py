@@ -47,6 +47,13 @@ def test_chat_bootstrap_returns_session_and_ui_url(client: TestClient, app) -> N
     assert session.dataset_id == payload["dataset"]["id"]
 
 
+def test_chat_bootstrap_skips_gemini_column_labels(client: TestClient, app) -> None:
+    payload = _bootstrap_chat(client)
+
+    assert payload["dataset"]["columns"]["time_axis"]["label"] == "Time Axis"
+    assert app.state._fake_gemini.structured_calls == []
+
+
 def test_chat_bootstrap_requires_api_key(app) -> None:
     with TestClient(app, raise_server_exceptions=True) as raw_client:
         response = raw_client.post(

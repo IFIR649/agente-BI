@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     duckdb_database: str = ":memory:"
     query_timeout_seconds: int = 5
-    max_upload_size_mb: int = 25
+    max_upload_size_mb: int = 1024
     max_top_n: int = 100
 
     cache_ttl_seconds: int = 600

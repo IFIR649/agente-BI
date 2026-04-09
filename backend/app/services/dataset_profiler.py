@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.app.config import Settings
-from backend.app.core.database import DuckDBManager, quote_identifier
+from backend.app.core.database import DuckDBManager, quote_identifier, quote_literal
 from backend.app.core.gemini_client import GeminiClient
 from backend.app.core.utils import humanize_identifier, normalize_text, pluralize, singularize, slugify
 from backend.app.models.dataset import (
@@ -96,6 +96,7 @@ class DatasetProfiler:
         filename: str,
         content: bytes,
         metadata: UploadMetadata | None = None,
+        generate_labels: bool = True,
     ) -> DatasetCatalog:
         metadata = metadata or UploadMetadata()
         dataset_id = self._generate_dataset_id(metadata.display_name or Path(filename).stem)
@@ -108,6 +109,7 @@ class DatasetProfiler:
                 csv_path=csv_path,
                 original_filename=filename,
                 metadata=metadata,
+                generate_labels=generate_labels,
             )
             self._save_catalog(catalog)
             return catalog
@@ -204,11 +206,20 @@ class DatasetProfiler:
         manual_aliases: dict[str, str] | None = None,
         label_overrides: dict[str, str] | None = None,
         created_at: datetime | None = None,
+        generate_labels: bool = True,
     ) -> DatasetCatalog:
         manual_aliases = dict(manual_aliases or metadata.aliases)
         label_overrides = dict(label_overrides or {})
         with self.db_manager.session() as connection:
-            self.db_manager.register_csv_view(connection, csv_path)
+            try:
+                connection.execute("SET statement_timeout='0s'")
+            except Exception:
+                pass
+            safe_path = quote_literal(str(csv_path))
+            connection.execute(
+                f"CREATE TEMP TABLE dataset_view AS "
+                f"SELECT * FROM read_csv_auto({safe_path}, SAMPLE_SIZE=-1, HEADER=TRUE)"
+            )
             describe_rows = connection.execute("DESCRIBE SELECT * FROM dataset_view").fetchall()
             row_count = int(connection.execute("SELECT COUNT(*) FROM dataset_view").fetchone()[0])
 
@@ -225,7 +236,11 @@ class DatasetProfiler:
 
             self._assign_semantic_roles(columns=columns, row_count=row_count)
             sample_rows = self._collect_sample_rows(connection, list(columns.keys()), n=3)
-            generated_labels = self._generate_column_labels(columns=columns, sample_rows=sample_rows)
+            generated_labels = (
+                self._generate_column_labels(columns=columns, sample_rows=sample_rows)
+                if generate_labels
+                else {}
+            )
             self._apply_column_labels(
                 columns=columns,
                 generated_labels=generated_labels,
